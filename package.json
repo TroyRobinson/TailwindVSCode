@@ -1,0 +1,43 @@
+{
+  "name": "tailwind-preview-hover",
+  "displayName": "Tailwind Preview + Hover",
+  "description": "Preview HTML with Tailwind (CDN or local) and hover elements to see applied Tailwind classes.",
+  "version": "0.0.1",
+  "publisher": "local-dev",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:html",
+    "onCommand:tailwindPreview.openPreview"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "tailwindPreview.openPreview",
+        "title": "Tailwind: Open Preview",
+        "category": "Tailwind",
+        "icon": "$(eye)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "tailwindPreview.openPreview",
+          "group": "navigation@1",
+          "when": "resourceLangId == html && tailwindPreview.hasTailwind"
+        }
+      ]
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "license": "UNLICENSED"
+}
+
