@@ -28,15 +28,63 @@ function activate(context) {
       }
     );
 
-    panel.webview.html = buildPreviewHtml(panel.webview, doc.uri, htmlText);
+    // Store mapping from preview element uid -> source class attr offsets
+    let classOffsetMap = new Map();
+    const setPreview = () => {
+      const prepared = preparePreviewHtml(panel.webview, doc.uri, htmlText);
+      classOffsetMap = prepared.mapping;
+      panel.webview.html = prepared.html;
+    };
+
+    setPreview();
 
     // Refresh preview on save of the same document
     const saveSub = vscode.workspace.onDidSaveTextDocument((saved) => {
       if (saved.uri.toString() === doc.uri.toString()) {
-        panel.webview.html = buildPreviewHtml(panel.webview, doc.uri, saved.getText());
+        const prepared = preparePreviewHtml(panel.webview, doc.uri, saved.getText());
+        classOffsetMap = prepared.mapping;
+        panel.webview.html = prepared.html;
       }
     });
     panel.onDidDispose(() => saveSub.dispose());
+
+    // Handle class updates from the preview
+    panel.webview.onDidReceiveMessage(async (msg) => {
+      try {
+        if (!msg || msg.type !== 'updateClasses') return;
+        const { uid, newValue } = msg;
+        if (!uid || typeof newValue !== 'string') return;
+
+        const info = classOffsetMap.get(String(uid));
+        if (!info) {
+          vscode.window.showWarningMessage('Could not map edited element back to source. Reopen preview.');
+          return;
+        }
+
+        // Compute range in the current document from recorded offsets
+        const startPos = doc.positionAt(info.start);
+        const endPos = doc.positionAt(info.end);
+        const currentText = doc.getText(new vscode.Range(startPos, endPos));
+        // Optional safety: if the source diverged, warn and skip
+        if (typeof info.original === 'string' && currentText !== info.original) {
+          vscode.window.showWarningMessage('Source changed since preview was opened. Please reopen the preview.');
+          return;
+        }
+
+        const edit = new vscode.WorkspaceEdit();
+        edit.replace(doc.uri, new vscode.Range(startPos, endPos), newValue);
+        const ok = await vscode.workspace.applyEdit(edit);
+        if (!ok) {
+          vscode.window.showErrorMessage('Failed to apply Tailwind class edit to source.');
+          return;
+        }
+        // Update our record to the new value so subsequent edits validate correctly
+        classOffsetMap.set(String(uid), { ...info, original: newValue });
+      } catch (e) {
+        console.error('Failed to handle updateClasses', e);
+        vscode.window.showErrorMessage('Error updating classes in source. Check console for details.');
+      }
+    });
   });
 
   context.subscriptions.push(openPreviewCmd);
@@ -101,8 +149,9 @@ function hasTailwind(html) {
  * @param {vscode.Uri} docUri
  * @param {string} sourceHtml
  */
-function buildPreviewHtml(webview, docUri, sourceHtml) {
-  let html = sourceHtml;
+function preparePreviewHtml(webview, docUri, sourceHtml) {
+  const { annotatedHtml, mapping } = annotateHtmlForClassOffsets(sourceHtml);
+  let html = annotatedHtml;
 
   // Normalize line endings for simpler regex ops
   // 1) Inject <base> into <head> if not present, or create <head>
@@ -160,7 +209,7 @@ function buildPreviewHtml(webview, docUri, sourceHtml) {
     html = `<!DOCTYPE html><html><head>${cspMeta}${baseTag}</head><body>${html}${helperScript}</body></html>`;
   }
 
-  return html;
+  return { html, mapping };
 }
 
 function getHelperScript() {
@@ -176,6 +225,11 @@ function getHelperScript() {
   html, body { min-height: 100%; }
   /* Avoid covering dev content with our tooltip if near bottom-right */
 @media (max-width: 500px) { #twv-tooltip { max-width: 90vw; } }
+  #twv-editor { position: fixed; z-index: 2147483647; background: #111827; color: #e5e7eb; border: 1px solid #374151; border-radius: 6px; padding: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.45); width: min(70vw, 480px); }
+  #twv-editor input { width: 100%; background: #0b1220; color: #e5e7eb; border: 1px solid #374151; border-radius: 4px; padding: 6px 8px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+  #twv-editor .twv-actions { margin-top: 6px; display: flex; gap: 6px; justify-content: flex-end; }
+  #twv-editor button { background: #0ea5e9; color: #0b1220; border: none; padding: 4px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; }
+  #twv-editor button.twv-cancel { background: #374151; color: #e5e7eb; }
 </style>
 <script>
   (function(){
@@ -183,9 +237,18 @@ function getHelperScript() {
       const d = document;
       const outline = d.createElement('div'); outline.id = 'twv-hover-outline'; outline.className='hidden'; d.documentElement.appendChild(outline);
       const tooltip = d.createElement('div'); tooltip.id = 'twv-tooltip'; tooltip.className='hidden'; d.documentElement.appendChild(tooltip);
+      const editor = d.createElement('div'); editor.id = 'twv-editor'; editor.style.display = 'none';
+      editor.innerHTML = '<div style="margin-bottom:6px;color:#9ca3af">Edit Tailwind classes</div>'+
+        '<input id="twv-input" type="text" spellcheck="false" />'+
+        '<div class="twv-actions"><button class="twv-cancel">Cancel</button><button class="twv-save">Save</button></div>';
+      d.documentElement.appendChild(editor);
+      const input = editor.querySelector('#twv-input');
+      const btnSave = editor.querySelector('.twv-save');
+      const btnCancel = editor.querySelector('.twv-cancel');
+      const vscodeApi = (typeof acquireVsCodeApi === 'function') ? acquireVsCodeApi() : null;
 
       function isOurNode(node) {
-        return node && (node.id === 'twv-hover-outline' || node.id === 'twv-tooltip' || node.closest && (node.closest('#twv-hover-outline') || node.closest('#twv-tooltip')));
+        return node && (node.id === 'twv-hover-outline' || node.id === 'twv-tooltip' || node.id === 'twv-editor' || node.closest && (node.closest('#twv-hover-outline') || node.closest('#twv-tooltip') || node.closest('#twv-editor')));
       }
 
       function updateUI(target, x, y) {
@@ -229,10 +292,112 @@ function getHelperScript() {
       d.addEventListener('mousemove', onMove, { capture: true, passive: true });
       d.addEventListener('mouseleave', hideUI, { capture: true, passive: true });
       window.addEventListener('scroll', () => { if (lastEl) { const r = lastEl.getBoundingClientRect(); outline.style.left=r.left+'px'; outline.style.top=r.top+'px'; outline.style.width=r.width+'px'; outline.style.height=r.height+'px'; } }, { passive: true });
+
+      function openEditorFor(el, x, y) {
+        try {
+          if (!el || !(el instanceof Element)) return;
+          const uid = el.getAttribute('data-twv-uid');
+          if (!uid) { console.warn('No uid on element; cannot edit'); return; }
+          const rect = el.getBoundingClientRect();
+          const vw = window.innerWidth; const vh = window.innerHeight;
+          const ex = Math.min(vw - 16, Math.max(8, (x || rect.left) + 12));
+          const ey = Math.min(vh - 16, Math.max(8, (y || rect.top) + 12));
+          input.value = (el.getAttribute('class') || '').trim();
+          editor.style.left = ex + 'px'; editor.style.top = ey + 'px';
+          editor.style.display = 'block';
+          input.focus(); input.select();
+
+          function commit() {
+            const newVal = input.value.trim();
+            el.setAttribute('class', newVal);
+            if (vscodeApi) {
+              vscodeApi.postMessage({ type: 'updateClasses', uid, newValue: newVal });
+            }
+            close();
+          }
+          function close() {
+            editor.style.display = 'none';
+            input.blur();
+            d.removeEventListener('keydown', onKey);
+          }
+          function onKey(ev) {
+            if (ev.key === 'Escape') { ev.preventDefault(); close(); }
+            if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey || !ev.shiftKey)) { ev.preventDefault(); commit(); }
+          }
+          d.addEventListener('keydown', onKey, { capture: true });
+          btnCancel.onclick = (ev) => { ev.preventDefault(); close(); };
+          btnSave.onclick = (ev) => { ev.preventDefault(); commit(); };
+        } catch (e) { console.error('openEditor error', e); }
+      }
+
+      d.addEventListener('dblclick', (e) => {
+        const el = e.target;
+        if (!el || isOurNode(el)) return;
+        e.preventDefault(); e.stopPropagation();
+        openEditorFor(el, e.clientX, e.clientY);
+      }, { capture: true });
     } catch (e) { console.error('twv helper error', e); }
   })();
 </script>
 `;
+}
+
+// Annotate the HTML source by adding data-twv-uid to elements with a class attribute
+// and compute a mapping of uid -> { start, end, original }
+function annotateHtmlForClassOffsets(sourceHtml) {
+  try {
+    const mapping = new Map();
+    let out = '';
+    let last = 0;
+    let uidCounter = 1;
+
+    const tagRe = /<([a-zA-Z][\w:-]*)([^>]*)>/g; // start tags (simple heuristic)
+    let m;
+    while ((m = tagRe.exec(sourceHtml)) !== null) {
+      const full = m[0];
+      const tagName = m[1];
+      const attrs = m[2] || '';
+      // Ignore closing or doctype etc (already filtered by regex)
+
+      // Find class attribute in attrs
+      const classRe = /\bclass\s*=\s*(["'])([\s\S]*?)\1/i; // match quoted value, don't cross tag because attrs excludes '>'
+      const cm = classRe.exec(attrs);
+      if (!cm) continue;
+
+      // Compute offsets for the class value inside the document
+      const quote = cm[1];
+      const classValue = cm[2];
+      const attrsStartInFull = 1 + tagName.length; // after '<tag'
+      // Position of the opening quote within attrs string
+      const openQuoteInAttrs = cm.index + (cm[0].indexOf(quote));
+      const valueStartInAttrs = openQuoteInAttrs + 1;
+      const valueEndInAttrs = valueStartInAttrs + classValue.length;
+
+      const tagStartInDoc = m.index;
+      const valueStartInDoc = tagStartInDoc + attrsStartInFull + valueStartInAttrs;
+      const valueEndInDoc = tagStartInDoc + attrsStartInFull + valueEndInAttrs;
+
+      // Inject data-twv-uid before the closing '>' (or '/>')
+      const closeIsSelf = /\/>\s*$/.test(full);
+      const injection = ` data-twv-uid="${uidCounter}"`;
+      const insertPosInFull = full.length - (closeIsSelf ? 2 : 1);
+      const newStartTag = full.slice(0, insertPosInFull) + injection + full.slice(insertPosInFull);
+
+      // Append replaced segment to output
+      out += sourceHtml.slice(last, tagStartInDoc) + newStartTag;
+      last = tagStartInDoc + full.length;
+
+      mapping.set(String(uidCounter), { start: valueStartInDoc, end: valueEndInDoc, original: classValue });
+      uidCounter++;
+    }
+
+    out += sourceHtml.slice(last);
+    return { annotatedHtml: out, mapping };
+  } catch (e) {
+    console.error('annotateHtmlForClassOffsets error', e);
+    // Fallback: no annotation
+    return { annotatedHtml: sourceHtml, mapping: new Map() };
+  }
 }
 
 function deactivate() {}
