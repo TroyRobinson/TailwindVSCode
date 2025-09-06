@@ -51,35 +51,114 @@ function activate(context) {
     // Handle class updates from the preview
     panel.webview.onDidReceiveMessage(async (msg) => {
       try {
-        if (!msg || msg.type !== 'updateClasses') return;
-        const { uid, newValue } = msg;
-        if (!uid || typeof newValue !== 'string') return;
+        if (!msg || !msg.type) return;
+        if (msg.type === 'updateClasses') {
+          const { uid, newValue } = msg;
+          if (!uid || typeof newValue !== 'string') return;
 
-        const info = classOffsetMap.get(String(uid));
-        if (!info) {
-          vscode.window.showWarningMessage('Could not map edited element back to source. Reopen preview.');
-          return;
-        }
+          const info = classOffsetMap.get(String(uid));
+          if (!info) {
+            vscode.window.showWarningMessage('Could not map edited element back to source. Reopen preview.');
+            return;
+          }
 
-        // Compute range in the current document from recorded offsets
-        const startPos = doc.positionAt(info.start);
-        const endPos = doc.positionAt(info.end);
-        const currentText = doc.getText(new vscode.Range(startPos, endPos));
-        // Optional safety: if the source diverged, warn and skip
-        if (typeof info.original === 'string' && currentText !== info.original) {
-          vscode.window.showWarningMessage('Source changed since preview was opened. Please reopen the preview.');
-          return;
-        }
+          // Compute range in the current document from recorded offsets
+          const startPos = doc.positionAt(info.start);
+          const endPos = doc.positionAt(info.end);
+          const currentText = doc.getText(new vscode.Range(startPos, endPos));
+          // Optional safety: if the source diverged, warn and skip
+          if (typeof info.original === 'string' && currentText !== info.original) {
+            vscode.window.showWarningMessage('Source changed since preview was opened. Please reopen the preview.');
+            return;
+          }
 
-        const edit = new vscode.WorkspaceEdit();
-        edit.replace(doc.uri, new vscode.Range(startPos, endPos), newValue);
-        const ok = await vscode.workspace.applyEdit(edit);
-        if (!ok) {
-          vscode.window.showErrorMessage('Failed to apply Tailwind class edit to source.');
-          return;
+          const edit = new vscode.WorkspaceEdit();
+          edit.replace(doc.uri, new vscode.Range(startPos, endPos), newValue);
+          const ok = await vscode.workspace.applyEdit(edit);
+          if (!ok) {
+            vscode.window.showErrorMessage('Failed to apply Tailwind class edit to source.');
+            return;
+          }
+          // Update our record to the new value so subsequent edits validate correctly
+          classOffsetMap.set(String(uid), { ...info, original: newValue });
+        } else if (msg.type === 'updateDynamicTemplate') {
+          const before = (msg && typeof msg.before === 'string') ? msg.before : '';
+          const after = (msg && typeof msg.after === 'string') ? msg.after : '';
+          if (!before || !after || before === after) return;
+
+          const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const dqRe = new RegExp(`"${escapeRe(before)}"`, 'g');
+          const sqRe = new RegExp(`'${escapeRe(before)}'`, 'g');
+          const btRe = new RegExp('`' + escapeRe(before) + '`', 'g');
+
+          const edits = new vscode.WorkspaceEdit();
+          const changed = new Set();
+
+          // 1) Inline <script> blocks within this HTML file
+          {
+            const full = doc.getText();
+            const scriptRe = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
+            let m;
+            let newText = '';
+            let lastIndex = 0;
+            while ((m = scriptRe.exec(full)) !== null) {
+              const openEnd = m.index + m[0].indexOf('>') + 1;
+              const innerStart = openEnd;
+              const innerEnd = m.index + m[0].length - '</script>'.length;
+              const beforeScript = full.slice(lastIndex, innerStart);
+              const inner = full.slice(innerStart, innerEnd);
+              const afterScript = full.slice(innerEnd, scriptRe.lastIndex);
+              let replacedInner = inner.replace(dqRe, `"${after}"`).replace(sqRe, `'${after}'`).replace(btRe, '`' + after + '`');
+              newText += beforeScript + replacedInner + afterScript;
+              lastIndex = scriptRe.lastIndex;
+            }
+            newText += full.slice(lastIndex);
+            if (newText !== full) {
+              const all = new vscode.Range(doc.positionAt(0), doc.positionAt(full.length));
+              edits.replace(doc.uri, all, newText);
+              changed.add(doc.uri.toString());
+            }
+          }
+
+          // 2) External <script src="..."> files (workspace-local)
+          try {
+            const full = doc.getText();
+            const srcRe = /<script\b[^>]*\bsrc=("|')([^"']+)\1[^>]*>/gi;
+            let m;
+            const files = [];
+            const docDir = (doc.uri.scheme === 'file') ? vscode.Uri.file(path.dirname(doc.uri.fsPath)) : null;
+            while ((m = srcRe.exec(full)) !== null) {
+              const src = (m[2] || '').trim();
+              if (!src || /^https?:/i.test(src) || /^\/\//.test(src)) continue;
+              let uri = null;
+              if (src.startsWith('/')) {
+                const folders = vscode.workspace.workspaceFolders || [];
+                if (folders.length > 0) uri = vscode.Uri.joinPath(folders[0].uri, ...src.slice(1).split('/'));
+              } else if (docDir) {
+                uri = vscode.Uri.joinPath(docDir, ...src.split('/'));
+              }
+              if (uri) files.push(uri);
+            }
+            for (const uri of files) {
+              try {
+                const buf = await vscode.workspace.fs.readFile(uri);
+                const text = Buffer.from(buf).toString('utf8');
+                const replaced = text.replace(dqRe, `"${after}"`).replace(sqRe, `'${after}'`).replace(btRe, '`' + after + '`');
+                if (replaced !== text) {
+                  const fileDoc = await vscode.workspace.openTextDocument(uri);
+                  const all = new vscode.Range(fileDoc.positionAt(0), fileDoc.positionAt(text.length));
+                  edits.replace(uri, all, replaced);
+                  changed.add(uri.toString());
+                }
+              } catch {}
+            }
+          } catch {}
+
+          if (changed.size > 0) {
+            const ok = await vscode.workspace.applyEdit(edits);
+            if (!ok) vscode.window.showErrorMessage('Failed to update dynamic class template in source.');
+          }
         }
-        // Update our record to the new value so subsequent edits validate correctly
-        classOffsetMap.set(String(uid), { ...info, original: newValue });
       } catch (e) {
         console.error('Failed to handle updateClasses', e);
         vscode.window.showErrorMessage('Error updating classes in source. Check console for details.');
@@ -236,7 +315,7 @@ function getHelperScript() {
   #twv-controls button:hover { background: #111827; }
   #twv-controls svg { width: 14px; height: 14px; fill: currentColor; }
   /* Interaction shield shown when paused */
-  #twv-shield { position: fixed; inset: 0; z-index: 2147483644; background: transparent; display: none; }
+  #twv-shield { position: fixed; inset: 0; z-index: 2147483644; background: transparent; display: none; pointer-events: none; }
   html.twv-paused #twv-shield { display: block; }
   /* Freeze animations and transitions when paused */
   html.twv-paused body, html.twv-paused body * { cursor: default !important; }
@@ -249,14 +328,60 @@ function getHelperScript() {
       const outline = d.createElement('div'); outline.id = 'twv-hover-outline'; outline.className='hidden'; d.documentElement.appendChild(outline);
       const tooltip = d.createElement('div'); tooltip.id = 'twv-tooltip'; tooltip.className='hidden'; d.documentElement.appendChild(tooltip);
       const editor = d.createElement('div'); editor.id = 'twv-editor'; editor.style.display = 'none';
-      editor.innerHTML = '<div style="margin-bottom:6px;color:#9ca3af">Edit Tailwind classes</div>'+
+      editor.innerHTML = '<div id="twv-title" style="margin-bottom:6px;color:#9ca3af">Edit Tailwind classes</div>'+
         '<input id="twv-input" type="text" spellcheck="false" />'+
         '<div class="twv-actions"><button class="twv-cancel">Cancel</button><button class="twv-save">Save</button></div>';
       d.documentElement.appendChild(editor);
       const input = editor.querySelector('#twv-input');
+      const titleEl = editor.querySelector('#twv-title');
       const btnSave = editor.querySelector('.twv-save');
       const btnCancel = editor.querySelector('.twv-cancel');
       const vscodeApi = (typeof acquireVsCodeApi === 'function') ? acquireVsCodeApi() : null;
+
+      // Runtime class template rules: when a dynamic element is edited (no source uid),
+      // remember its original->new class set and apply to future matching elements.
+      const runtimeClassRules = [];
+      function canonTokens(str) { return (str || '').trim().split(/\s+/).filter(Boolean).sort(); }
+      function canonKey(str) { return canonTokens(str).join(' '); }
+      function findAnchor(tokens) {
+        // Pick a simple, CSS-safe class token to anchor queries (e.g., 'token-word')
+        for (const t of tokens) { if (/^[A-Za-z_][\w-]*$/.test(t)) return t; }
+        return null;
+      }
+      function applyRulesToElement(el) {
+        if (!(el instanceof Element)) return;
+        const curKey = canonKey(el.getAttribute('class') || '');
+        for (const r of runtimeClassRules) {
+          if (curKey === r.oldKey) { el.setAttribute('class', r.newValue); break; }
+        }
+      }
+      function applyRuleGlobally(rule) {
+        try {
+          const anchor = rule.anchorClass;
+          if (anchor) {
+            // Escape CSS identifier safely for simple classes
+            const sel = '.' + anchor.replace(/([^A-Za-z0-9_-])/g, '\\$1');
+            d.querySelectorAll(sel).forEach(applyRulesToElement);
+          } else {
+            // Fallback: scan a bounded set if no safe anchor
+            Array.from(d.querySelectorAll('[class]')).slice(0, 5000).forEach(applyRulesToElement);
+          }
+        } catch (e) { console.warn('applyRuleGlobally error', e); }
+      }
+      const mo = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          if (m.type === 'childList') {
+            m.addedNodes && m.addedNodes.forEach((n) => {
+              if (n.nodeType === 1) {
+                applyRulesToElement(n);
+                // Also apply to descendants
+                n.querySelectorAll && n.querySelectorAll('[class]').forEach(applyRulesToElement);
+              }
+            });
+          }
+        }
+      });
+      mo.observe(d.documentElement, { childList: true, subtree: true });
 
       // Interaction shield and pause/resume controls
       const shield = d.createElement('div');
@@ -324,13 +449,20 @@ function getHelperScript() {
 
       let lastEl = null;
       function underlyingElementAt(x, y) {
-        // Temporarily disable the shield to probe underlying element when paused
-        let prev = null;
-        if (paused && shield && shield.style) { prev = shield.style.pointerEvents || ''; shield.style.pointerEvents = 'none'; }
-        // Move tooltip away first so elementFromPoint can hit underlying element
+        // Temporarily move our tooltip away so it doesn't block hit testing
+        const prevLeft = tooltip.style.left, prevTop = tooltip.style.top;
         tooltip.style.left = '-10000px'; tooltip.style.top = '-10000px';
-        const el = d.elementFromPoint(x, y);
-        if (prev !== null) shield.style.pointerEvents = prev;
+        // Prefer elementsFromPoint to include elements with pointer-events:none (e.g., tooltips)
+        let el = null;
+        if (typeof d.elementsFromPoint === 'function') {
+          const list = d.elementsFromPoint(x, y) || [];
+          el = list.find((n) => n instanceof Element && !isOurNode(n)) || null;
+        } else {
+          el = d.elementFromPoint(x, y);
+          if (el && isOurNode(el)) el = null;
+        }
+        // Restore tooltip position
+        tooltip.style.left = prevLeft; tooltip.style.top = prevTop;
         return el;
       }
       function onMove(e){
@@ -347,8 +479,9 @@ function getHelperScript() {
       function openEditorFor(el, x, y) {
         try {
           if (!el || !(el instanceof Element)) return;
-          const uid = el.getAttribute('data-twv-uid');
-          if (!uid) { console.warn('No uid on element; cannot edit'); return; }
+          // Find a source-mapped element if present (may be the same as el)
+          const uidEl = (el.closest && el.closest('[data-twv-uid]')) || null;
+          const uid = uidEl ? uidEl.getAttribute('data-twv-uid') : null;
           const rect = el.getBoundingClientRect();
           const vw = window.innerWidth; const vh = window.innerHeight;
           const ex = Math.min(vw - 16, Math.max(8, (x || rect.left) + 12));
@@ -357,12 +490,36 @@ function getHelperScript() {
           editor.style.left = ex + 'px'; editor.style.top = ey + 'px';
           editor.style.display = 'block';
           input.focus(); input.select();
+          if (titleEl) {
+            if (uid && uidEl === el) {
+              titleEl.textContent = 'Edit Tailwind classes';
+            } else if (uid) {
+              titleEl.textContent = 'Edit Tailwind classes (preview only)';
+            } else {
+              titleEl.textContent = 'Edit Tailwind classes (preview only)';
+            }
+          }
 
           function commit() {
+            const beforeVal = (el.getAttribute('class') || '').trim();
             const newVal = input.value.trim();
             el.setAttribute('class', newVal);
-            if (vscodeApi) {
-              vscodeApi.postMessage({ type: 'updateClasses', uid, newValue: newVal });
+            if (beforeVal !== newVal) {
+              // Only persist to source if we are editing the mapped element itself
+              if (vscodeApi && uid && uidEl === el) {
+                vscodeApi.postMessage({ type: 'updateClasses', uid, newValue: newVal });
+              } else if (vscodeApi) {
+                // Register a runtime rule so future dynamic nodes match the new classes
+                const oldKey = canonKey(beforeVal);
+                const newKey = canonKey(newVal);
+                if (oldKey && newKey) {
+                  const anchorClass = findAnchor(canonTokens(beforeVal));
+                  runtimeClassRules.push({ oldKey, newValue: newVal, anchorClass });
+                  applyRuleGlobally({ oldKey, newValue: newVal, anchorClass });
+                }
+                // Suggest updating string literals inside <script> tags in source
+                vscodeApi.postMessage({ type: 'updateDynamicTemplate', before: beforeVal, after: newVal });
+              }
             }
             close();
           }
@@ -392,10 +549,24 @@ function getHelperScript() {
       }, { capture: true });
 
       // Swallow most interactions while paused to avoid mutating app state
-      const swallow = (ev) => { if (paused) { ev.stopImmediatePropagation(); ev.preventDefault(); } };
-      ['click','mousedown','mouseup','pointerdown','pointerup','contextmenu','touchstart','touchend','dragstart'].forEach(t => {
-        shield.addEventListener(t, swallow, { capture: true });
-      });
+      const swallow = (ev) => {
+        if (!paused) return;
+        // Allow interactions with our own UI controls/editor
+        const path = ev.composedPath ? ev.composedPath() : [];
+        const t = ev.target;
+        const inOurUi = (n) => !!n && (
+          (n.id === 'twv-controls' || n.id === 'twv-editor' || n.id === 'twv-tooltip' || n.id === 'twv-hover-outline') ||
+          (n.closest && (n.closest('#twv-controls') || n.closest('#twv-editor') || n.closest('#twv-tooltip') || n.closest('#twv-hover-outline')))
+        );
+        if (inOurUi(t) || (Array.isArray(path) && path.some(inOurUi))) return;
+        ev.stopImmediatePropagation();
+        ev.preventDefault();
+      };
+      [
+        'click','dblclick','mousedown','mouseup','pointerdown','pointerup','pointermove','mousemove','contextmenu',
+        'touchstart','touchend','dragstart','dragover','drop',
+        'mouseover','mouseout','mouseenter','mouseleave'
+      ].forEach(t => { d.addEventListener(t, swallow, { capture: true }); });
     } catch (e) { console.error('twv helper error', e); }
   })();
 </script>
