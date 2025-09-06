@@ -448,6 +448,28 @@ function getHelperScript() {
       function hideUI(){ outline.classList.add('hidden'); tooltip.classList.add('hidden'); }
 
       let lastEl = null;
+      function findPointerNoneOverlayAt(x, y) {
+        if (!paused) return null;
+        try {
+          const cand = Array.from(d.querySelectorAll('.pointer-events-none, [style*="pointer-events: none"]'))
+            .filter((n) => n instanceof Element && !isOurNode(n))
+            .filter((n) => {
+              const r = n.getBoundingClientRect();
+              return r.width > 0 && r.height > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+            })
+            .map((n) => {
+              const cs = getComputedStyle(n);
+              const zi = parseInt(cs.zIndex, 10);
+              const z = Number.isFinite(zi) ? zi : 0;
+              const pos = cs.position || '';
+              const bonus = (pos === 'fixed' ? 3 : pos === 'sticky' ? 2 : pos === 'absolute' ? 1 : 0);
+              return { n, z: z * 10 + bonus };
+            })
+            .sort((a, b) => b.z - a.z);
+          return cand.length ? cand[0].n : null;
+        } catch { return null; }
+      }
+
       function underlyingElementAt(x, y) {
         // Temporarily move our tooltip away so it doesn't block hit testing
         const prevLeft = tooltip.style.left, prevTop = tooltip.style.top;
@@ -461,6 +483,9 @@ function getHelperScript() {
           el = d.elementFromPoint(x, y);
           if (el && isOurNode(el)) el = null;
         }
+        // If paused, prefer a visually-overlapping pointer-events:none overlay at this point
+        const maybeOverlay = findPointerNoneOverlayAt(x, y);
+        if (maybeOverlay) el = maybeOverlay;
         // Restore tooltip position
         tooltip.style.left = prevLeft; tooltip.style.top = prevTop;
         return el;
