@@ -230,6 +230,17 @@ function getHelperScript() {
   #twv-editor .twv-actions { margin-top: 6px; display: flex; gap: 6px; justify-content: flex-end; }
   #twv-editor button { background: #0ea5e9; color: #0b1220; border: none; padding: 4px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; }
   #twv-editor button.twv-cancel { background: #374151; color: #e5e7eb; }
+  /* Pause/Play controls */
+  #twv-controls { position: fixed; top: 8px; right: 8px; z-index: 2147483648; display: flex; gap: 6px; }
+  #twv-controls button { background: rgba(17,24,39,0.9); color: #e5e7eb; border: 1px solid #374151; border-radius: 6px; padding: 4px 8px; font-size: 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+  #twv-controls button:hover { background: #111827; }
+  #twv-controls svg { width: 14px; height: 14px; fill: currentColor; }
+  /* Interaction shield shown when paused */
+  #twv-shield { position: fixed; inset: 0; z-index: 2147483644; background: transparent; display: none; }
+  html.twv-paused #twv-shield { display: block; }
+  /* Freeze animations and transitions when paused */
+  html.twv-paused body, html.twv-paused body * { cursor: default !important; }
+  html.twv-paused *, html.twv-paused *::before, html.twv-paused *::after { animation-play-state: paused !important; transition: none !important; }
 </style>
 <script>
   (function(){
@@ -247,8 +258,40 @@ function getHelperScript() {
       const btnCancel = editor.querySelector('.twv-cancel');
       const vscodeApi = (typeof acquireVsCodeApi === 'function') ? acquireVsCodeApi() : null;
 
+      // Interaction shield and pause/resume controls
+      const shield = d.createElement('div');
+      shield.id = 'twv-shield';
+      d.documentElement.appendChild(shield);
+      const controls = d.createElement('div');
+      controls.id = 'twv-controls';
+      controls.innerHTML = '<button id="twv-toggle" title="Pause interactions"><span class="twv-icon"></span><span class="twv-label">Pause</span></button>';
+      d.documentElement.appendChild(controls);
+      const toggleBtn = controls.querySelector('#twv-toggle');
+      const iconSpan = toggleBtn.querySelector('.twv-icon');
+      const labelSpan = toggleBtn.querySelector('.twv-label');
+      let paused = false;
+      const playSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>';
+      const pauseSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>';
+      function setPaused(on) {
+        paused = !!on;
+        d.documentElement.classList.toggle('twv-paused', paused);
+        if (paused) {
+          iconSpan.innerHTML = playSvg; labelSpan.textContent = 'Resume'; toggleBtn.title = 'Resume interactions';
+          try { d.querySelectorAll('video, audio').forEach(el => { try { if (!el.paused && typeof el.pause === 'function') el.pause(); } catch(_){} }); } catch(_){}
+        } else {
+          iconSpan.innerHTML = pauseSvg; labelSpan.textContent = 'Pause'; toggleBtn.title = 'Pause interactions';
+        }
+      }
+      // Initialize button state
+      iconSpan.innerHTML = pauseSvg;
+      toggleBtn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); setPaused(!paused); });
+      d.addEventListener('keydown', (e) => { if ((e.key === 'p' || e.key === 'P') && !(e.metaKey||e.ctrlKey||e.altKey||e.shiftKey)) { e.stopPropagation(); setPaused(!paused); } }, { capture: true });
+
       function isOurNode(node) {
-        return node && (node.id === 'twv-hover-outline' || node.id === 'twv-tooltip' || node.id === 'twv-editor' || node.closest && (node.closest('#twv-hover-outline') || node.closest('#twv-tooltip') || node.closest('#twv-editor')));
+        return node && (
+          node.id === 'twv-hover-outline' || node.id === 'twv-tooltip' || node.id === 'twv-editor' || node.id === 'twv-shield' || node.id === 'twv-controls' ||
+          (node.closest && (node.closest('#twv-hover-outline') || node.closest('#twv-tooltip') || node.closest('#twv-editor') || node.closest('#twv-controls')))
+        );
       }
 
       function updateUI(target, x, y) {
@@ -280,11 +323,19 @@ function getHelperScript() {
       function hideUI(){ outline.classList.add('hidden'); tooltip.classList.add('hidden'); }
 
       let lastEl = null;
-      function onMove(e){
-        const x = e.clientX; const y = e.clientY;
+      function underlyingElementAt(x, y) {
+        // Temporarily disable the shield to probe underlying element when paused
+        let prev = null;
+        if (paused && shield && shield.style) { prev = shield.style.pointerEvents || ''; shield.style.pointerEvents = 'none'; }
         // Move tooltip away first so elementFromPoint can hit underlying element
         tooltip.style.left = '-10000px'; tooltip.style.top = '-10000px';
         const el = d.elementFromPoint(x, y);
+        if (prev !== null) shield.style.pointerEvents = prev;
+        return el;
+      }
+      function onMove(e){
+        const x = e.clientX; const y = e.clientY;
+        const el = underlyingElementAt(x, y);
         if (!el || isOurNode(el)) { hideUI(); return; }
         if (el !== lastEl) { lastEl = el; }
         updateUI(el, x, y);
@@ -331,11 +382,20 @@ function getHelperScript() {
       }
 
       d.addEventListener('dblclick', (e) => {
-        const el = e.target;
+        let el = e.target;
+        if (!el || isOurNode(el) || paused) {
+          el = underlyingElementAt(e.clientX, e.clientY);
+        }
         if (!el || isOurNode(el)) return;
         e.preventDefault(); e.stopPropagation();
         openEditorFor(el, e.clientX, e.clientY);
       }, { capture: true });
+
+      // Swallow most interactions while paused to avoid mutating app state
+      const swallow = (ev) => { if (paused) { ev.stopImmediatePropagation(); ev.preventDefault(); } };
+      ['click','mousedown','mouseup','pointerdown','pointerup','contextmenu','touchstart','touchend','dragstart'].forEach(t => {
+        shield.addEventListener(t, swallow, { capture: true });
+      });
     } catch (e) { console.error('twv helper error', e); }
   })();
 </script>
