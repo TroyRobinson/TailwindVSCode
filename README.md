@@ -7,6 +7,7 @@ Features:
 - Editor title button on HTML files detected to use Tailwind.
 - Opens a live preview in a Webview beside the editor.
 - Hover over elements to see their classes in a tooltip, with a highlight box.
+- Pause/Resume control in preview to disable all interactivity for safe inspection and editing.
 
 Notes:
 
@@ -17,4 +18,3 @@ Notes:
 Commands:
 
 - Tailwind: Open Preview (`tailwindPreview.openPreview`)
-
