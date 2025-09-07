@@ -304,8 +304,8 @@ function getHelperScript() {
   html, body { min-height: 100%; }
   /* Avoid covering dev content with our tooltip if near bottom-right */
 @media (max-width: 500px) { #twv-tooltip { max-width: 90vw; } }
-  #twv-editor { position: fixed; z-index: 2147483647; background: #111827; color: #e5e7eb; border: 1px solid #374151; border-radius: 6px; padding: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.45); width: min(70vw, 480px); }
-  #twv-editor input { width: 100%; background: #0b1220; color: #e5e7eb; border: 1px solid #374151; border-radius: 4px; padding: 6px 8px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+  #twv-editor { position: fixed; z-index: 2147483647; background: #111827; color: #e5e7eb; border: 1px solid #374151; border-radius: 6px; padding: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.45); width: min(70vw, 560px); }
+  #twv-editor textarea { display:block; width: 100%; background: #0b1220; color: #e5e7eb; border: 1px solid #374151; border-radius: 4px; padding: 6px 8px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow: hidden; resize: none; min-height: 28px; max-height: 60vh; box-sizing: border-box; }
   #twv-editor .twv-actions { margin-top: 6px; display: flex; gap: 6px; justify-content: flex-end; }
   #twv-editor button { background: #0ea5e9; color: #0b1220; border: none; padding: 4px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; }
   #twv-editor button.twv-cancel { background: #374151; color: #e5e7eb; }
@@ -329,7 +329,7 @@ function getHelperScript() {
       const tooltip = d.createElement('div'); tooltip.id = 'twv-tooltip'; tooltip.className='hidden'; d.documentElement.appendChild(tooltip);
       const editor = d.createElement('div'); editor.id = 'twv-editor'; editor.style.display = 'none';
       editor.innerHTML = '<div id="twv-title" style="margin-bottom:6px;color:#9ca3af">Edit Tailwind classes</div>'+
-        '<input id="twv-input" type="text" spellcheck="false" />'+
+        '<textarea id="twv-input" spellcheck="false" rows="1" wrap="soft" aria-label="Tailwind classes"></textarea>'+
         '<div class="twv-actions"><button class="twv-cancel">Cancel</button><button class="twv-save">Save</button></div>';
       d.documentElement.appendChild(editor);
       const input = editor.querySelector('#twv-input');
@@ -514,7 +514,35 @@ function getHelperScript() {
           input.value = (el.getAttribute('class') || '').trim();
           editor.style.left = ex + 'px'; editor.style.top = ey + 'px';
           editor.style.display = 'block';
+
+          // Auto-size the textarea to fit content up to a max height
+          function autosize() {
+            try {
+              input.style.height = 'auto';
+              // Use scrollHeight to grow; clamp by max-height via CSS
+              const sh = input.scrollHeight;
+              input.style.height = Math.min(sh, Math.round(window.innerHeight * 0.6)) + 'px';
+              // Keep editor within viewport if content growth pushes it off-screen
+              fitInViewport();
+            } catch {}
+          }
+          function fitInViewport() {
+            const r = editor.getBoundingClientRect();
+            let nx = r.left; let ny = r.top;
+            if (r.right > vw - 8) nx = Math.max(8, vw - 8 - r.width);
+            if (r.bottom > vh - 8) ny = Math.max(8, vh - 8 - r.height);
+            if (r.left < 8) nx = 8;
+            if (r.top < 8) ny = 8;
+            editor.style.left = nx + 'px';
+            editor.style.top = ny + 'px';
+          }
+
+          autosize();
           input.focus(); input.select();
+          // Keep resizing as the user types or pastes
+          input.addEventListener('input', autosize);
+          // Resize on window changes too
+          window.addEventListener('resize', autosize, { passive: true });
           if (titleEl) {
             if (uid && uidEl === el) {
               titleEl.textContent = 'Edit Tailwind classes';
@@ -552,9 +580,12 @@ function getHelperScript() {
             editor.style.display = 'none';
             input.blur();
             d.removeEventListener('keydown', onKey);
+            input.removeEventListener('input', autosize);
+            window.removeEventListener('resize', autosize);
           }
           function onKey(ev) {
             if (ev.key === 'Escape') { ev.preventDefault(); close(); }
+            // Enter without Shift commits; Shift+Enter inserts newline
             if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey || !ev.shiftKey)) { ev.preventDefault(); commit(); }
           }
           d.addEventListener('keydown', onKey, { capture: true });
