@@ -595,8 +595,14 @@ function getHelperScript() {
       }
 
       d.addEventListener('dblclick', (e) => {
-        let el = e.target;
-        if (!el || isOurNode(el) || paused) {
+        const t = e.target;
+        // If the dblclick occurred inside our editor UI, allow native selection behavior.
+        if (t && (t.id === 'twv-editor' || (t.closest && t.closest('#twv-editor')))) {
+          return;
+        }
+        let el = t;
+        // For our non-editor UI (tooltip/outline) or when paused, resolve the underlying element.
+        if (!el || paused || (isOurNode(el) && !(el.closest && el.closest('#twv-editor')))) {
           el = underlyingElementAt(e.clientX, e.clientY);
         }
         if (!el || isOurNode(el)) return;
