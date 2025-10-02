@@ -1051,10 +1051,11 @@ async function persistDynamicClassEditWorkspace(before, after) {
   }
 }
 
-// Smart persistence for server preview edits:
+// Smart persistence for server preview edits (safer by default):
 // - Scan workspace for occurrences of the class string in string literals
-// - If exactly one file contains matches, update and save it automatically
-// - If multiple files contain matches, prompt the user to pick which files to update
+// - If multiple files contain matches, prefer the active editor's file.
+// - If still ambiguous, prompt the user to choose files to update, defaulting to the active file.
+// - Avoids silently global edits to reduce unintended side effects.
 async function persistDynamicClassEditSmart(before, after, hint) {
   try {
     const vscode = require('vscode');
@@ -1071,7 +1072,7 @@ async function persistDynamicClassEditSmart(before, after, hint) {
 
     let changedFiles = 0;
 
-    // First pass: simple exact literal replacement for speed
+    // First pass: simple exact literal replacement for speed (scoped)
     const dqRe = new RegExp('"' + escapeRe(before) + '"', 'g');
     const sqRe = new RegExp("'" + escapeRe(before) + "'", 'g');
     const btRe = new RegExp('`' + escapeRe(before) + '`', 'g');
@@ -1087,8 +1088,55 @@ async function persistDynamicClassEditSmart(before, after, hint) {
       } catch {}
     }
 
+    let singleTargetMode = false;
     if (exactMatches.length > 0) {
-      for (const m of exactMatches) {
+      // Determine scope: prefer active editor's file when present
+      const active = vscode.window.activeTextEditor && vscode.window.activeTextEditor.document && vscode.window.activeTextEditor.document.uri;
+      const activeMatch = active ? exactMatches.find(m => m.uri.toString() === active.toString()) : undefined;
+
+      // If more than one file matches, prompt the user to choose scope
+      let targets = [];
+      if (exactMatches.length === 1) {
+        targets = [exactMatches[0]];
+      } else if (activeMatch) {
+        // Prefer active file by default; ask whether to update others as well
+        const rel = (u) => {
+          const wf = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
+          if (wf) return vscode.workspace.asRelativePath(u, false);
+          return u.fsPath || u.path || String(u);
+        };
+        const choice = await vscode.window.showInformationMessage(
+          `The edited class string appears in ${exactMatches.length} files. Update only the active file (${rel(activeMatch.uri)}) or all matches?`,
+          { modal: false },
+          'Only Active File',
+          'Update All Files'
+        );
+        if (choice === 'Update All Files') {
+          targets = exactMatches;
+        } else {
+          targets = [activeMatch];
+          singleTargetMode = true;
+        }
+      } else {
+        // No active match; let the user choose one or all
+        const items = exactMatches.map((m) => {
+          const rel = vscode.workspace.asRelativePath(m.uri, false);
+          return { label: rel, description: m.uri.fsPath || m.uri.path, data: m };
+        });
+        const pick = await vscode.window.showQuickPick(items.concat([{ label: '$(check) Update All Files', description: 'Apply to every matching file', data: null }]), {
+          placeHolder: 'Select a file to update Tailwind classes, or choose Update All Files',
+          canPickMany: false,
+        });
+        if (!pick) return 0;
+        if (pick.data === null) {
+          targets = exactMatches;
+        } else {
+          targets = [pick.data];
+          singleTargetMode = true;
+        }
+      }
+
+      for (const m of targets) {
         try {
           const doc = await vscode.workspace.openTextDocument(m.uri);
           const text = doc.getText();
@@ -1104,7 +1152,12 @@ async function persistDynamicClassEditSmart(before, after, hint) {
       }
     }
 
-    // Second pass: tolerant matching (order/whitespace agnostic) for HTML-like files
+    // If we intentionally targeted a single file in exact pass, stop here to avoid touching other files
+    if (singleTargetMode && changedFiles > 0) {
+      return changedFiles;
+    }
+
+    // Second pass: tolerant matching (order/whitespace agnostic) for HTML-like files (single-file intent)
     for (const uri of files) {
       const ext = (uri.path || uri.fsPath || '').toLowerCase();
       if (!/(\.html$|\.vue$|\.svelte$|\.astro$)/.test(ext)) continue;
@@ -1152,7 +1205,7 @@ async function persistDynamicClassEditSmart(before, after, hint) {
       } catch {}
     }
 
-    // Third pass: tolerant string-literal matching across JS-like files
+    // Third pass: tolerant string-literal matching across JS-like files (single-file intent)
     const strRe = /(["'`])(?:\\.|(?!\1)[\s\S])*\1/g; // naive string literal matcher (handles escapes roughly)
     for (const uri of files) {
       const ext = (uri.path || uri.fsPath || '').toLowerCase();
