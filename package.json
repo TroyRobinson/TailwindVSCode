@@ -12,7 +12,8 @@
   ],
   "activationEvents": [
     "onLanguage:html",
-    "onCommand:tailwindPreview.openPreview"
+    "onCommand:tailwindPreview.openPreview",
+    "onCommand:tailwindPreview.openServerPreview"
   ],
   "main": "./extension.js",
   "contributes": {
@@ -22,6 +23,12 @@
         "title": "Tailwind: Open Preview",
         "category": "Tailwind",
         "icon": "$(eye)"
+      },
+      {
+        "command": "tailwindPreview.openServerPreview",
+        "title": "Tailwind: Open Server Preview",
+        "category": "Tailwind",
+        "icon": "$(browser)"
       }
     ],
     "menus": {
@@ -30,6 +37,11 @@
           "command": "tailwindPreview.openPreview",
           "group": "navigation@1",
           "when": "resourceLangId == html && tailwindPreview.hasTailwind"
+        },
+        {
+          "command": "tailwindPreview.openServerPreview",
+          "group": "navigation@2",
+          "when": "true"
         }
       ]
     }
@@ -40,4 +52,3 @@
   },
   "license": "UNLICENSED"
 }
-

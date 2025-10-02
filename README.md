@@ -2,6 +2,8 @@
 
 Preview any HTML file that uses Tailwind (CDN or local build) and hover elements to see applied classes in a tooltip.
 
+Quick start: command+shift+p then Tailwind: Open Server Preview
+
 Features:
 
 - Editor title button on HTML files detected to use Tailwind.
@@ -9,6 +11,8 @@ Features:
 - Hover over elements to see their classes in a tooltip, with a highlight box.
 - Pause/Resume control in preview to disable all interactivity for safe inspection and editing.
 - Editing runtime UI: When you edit classes on dynamically created elements, the extension applies the change to similar elements and updates inline/external script templates in the source when possible.
+- NEW: Server Preview for Vite/SSR dev servers. Open a URL (e.g., http://localhost:5173) in a webview, inject a lightweight client helper into your app, and edit Tailwind classes live. The extension persists exact string-literal class edits across your workspace (React/Vue/Svelte/HTML/etc.).
+  - Includes a Pause/Resume toggle in the preview toolbar to suppress app interactions while selecting elements.
 
 Notes:
 
@@ -19,6 +23,7 @@ Notes:
 Commands:
 
 - Tailwind: Open Preview (`tailwindPreview.openPreview`)
+- Tailwind: Open Server Preview (`tailwindPreview.openServerPreview`)
 
 **Development Notes**
 - Preview pipeline: The extension injects a helper script and styles into the webview. It inserts a `<base>` tag and a permissive CSP to allow Tailwind CDN and local assets. Absolute-root URLs (`/assets/...`) are rewritten to the first workspace folder.
@@ -38,3 +43,31 @@ Commands:
   - Class mapping is best‑effort; complicated HTML, framework hydration, or post‑render modifications can break uid match. Reopen the preview to re-sync.
   - CSS `:hover` cannot be “locked”; Pause preserves the current hover, but moving away will drop pure CSS hovers. JS‑driven overlays generally remain because we suppress their hide handlers.
   - Dynamic source updates only cover exact string matches in JS; broader persistence may require workspace‑wide find/replace or AST transforms.
+  - Server Preview cannot access cross‑origin iframe DOM. The remote client helper script must be included in your app’s HTML template to enable hover/edit inside the app frame.
+  - Some dev servers/frameworks set `X-Frame-Options` or `Content-Security-Policy: frame-ancestors 'none'` which will block embedding in the webview’s iframe. Disable these in development to use Server Preview.
+
+Server Preview: how it works
+- The extension spins up a tiny localhost server to serve a client helper script at `http://127.0.0.1:7832/twv-client.js` (port may vary if in use).
+- You open your dev server URL in a webview iframe. The iframe is allowed by the webview CSP (`frame-src http: https:`). The extension does not access iframe DOM.
+- You add `<script src="http://127.0.0.1:7832/twv-client.js"></script>` to your app’s root HTML template (e.g., `index.html` for Vite) during development. The client overlays hover + an editor on double‑click inside your app and posts updates to the parent webview.
+- The extension receives the edit (before/after class string) and performs a workspace‑wide exact string‑literal replacement across common web files (`html, js, jsx, ts, tsx, vue, svelte, astro`) while skipping `node_modules`, build outputs, etc. Vite/SSR HMR picks up changes immediately and recompiles Tailwind JIT.
+
+Server Preview gotchas and CORS/CSP notes
+- Iframe blocking: If your dev app refuses to load in an iframe, remove `X-Frame-Options` and any `Content-Security-Policy` `frame-ancestors` restrictions in development.
+- HTTP vs HTTPS: The webview CSP allows both `http:` and `https:` for `frame-src`, `script-src`, and `connect-src`. If your dev server is HTTPS with a self‑signed cert, your OS/trust store may prompt separately.
+- CORS: The client helper loads via a classic `<script src>` tag and does not require CORS. For fetch/XHR made by your app, the webview does not interfere. The helper server sets `Access-Control-Allow-Origin: *` in case your app explicitly uses CORS‑mode fetch to load it.
+- CSP in your app: If your app sets a strict CSP that blocks external scripts, whitelist `http://127.0.0.1:7832` (or the port shown in the Server Preview toolbar) under `script-src` in development.
+
+Step-by-step: test Server Preview
+1) Start a Vite app: `npm run dev` (e.g., http://localhost:5173).
+2) In VS Code, run “Tailwind: Open Server Preview”. Enter your dev URL when prompted.
+3) Click “Copy Client Script Tag” in the preview toolbar. Paste it into your app’s root HTML (e.g., `index.html`), near the end of `<body>` for dev only: `index.html: <body> … <script src="http://127.0.0.1:7832/twv-client.js"></script>`
+4) Reload the page if needed. Hover elements inside the preview to see classes. Double‑click an element to edit its classes.
+5) Use the Pause/Resume button (or press `p`) to pause interactions while you pick a target element.
+6) On save, the extension replaces exact string‑literal occurrences of the old classes with the new classes across your workspace. Watch the Vite console for HMR and verify the UI updates.
+7) Revert when done: remove the client script tag from your app (only needed during dev editing).
+
+Step-by-step: test classic HTML Preview
+1) Open an HTML file that uses Tailwind (CDN or local build).
+2) Click “Tailwind: Open Preview” in the editor title.
+3) Hover to inspect classes; double‑click to edit. Edits persist to the HTML source for mapped elements; dynamic edits attempt to update inline/external scripts referenced by the HTML.

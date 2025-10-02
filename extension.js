@@ -8,6 +8,79 @@ const path = require('path');
 function activate(context) {
   const HAS_TW_KEY = 'tailwindPreview.hasTailwind';
 
+  // Lazy HTTP server for serving the remote preview client helper script
+  let clientServer = null;
+  let clientServerPort = null;
+  async function getOrStartClientServer() {
+    if (clientServer && clientServerPort) return { port: clientServerPort };
+    const http = require('http');
+    const net = require('net');
+    const CLIENT_PATH = '/twv-client.js';
+    const script = getRemoteClientScript();
+
+    // Pick a port: try 7832, fall back to an ephemeral port
+    async function findPort(preferred) {
+      function tryListen(p) {
+        return new Promise((resolve) => {
+          const srv = net.createServer();
+          srv.once('error', () => resolve(null));
+          srv.once('listening', () => srv.close(() => resolve(p)));
+          srv.listen(p, '127.0.0.1');
+        });
+      }
+      let p = preferred ? await tryListen(preferred) : null;
+      if (!p) p = await tryListen(0); // ephemeral
+      return p;
+    }
+
+    const port = await findPort(7832);
+    clientServerPort = port;
+    clientServer = http.createServer((req, res) => {
+      try {
+        // Basic routing
+        const u = new URL(req.url || '/', `http://localhost:${port}`);
+        if (req.method === 'OPTIONS') {
+          res.writeHead(204, {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type',
+            'Cache-Control': 'no-store',
+          });
+          res.end();
+          return;
+        }
+        if (u.pathname === CLIENT_PATH && req.method === 'GET') {
+          res.writeHead(200, {
+            'Content-Type': 'application/javascript; charset=utf-8',
+            'Cache-Control': 'no-store',
+            'Access-Control-Allow-Origin': '*',
+          });
+          res.end(script);
+          return;
+        }
+        if (u.pathname === '/health') {
+          res.writeHead(200, {
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Cache-Control': 'no-store',
+            'Access-Control-Allow-Origin': '*',
+          });
+          res.end('ok');
+          return;
+        }
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
+        res.end('not found');
+      } catch (e) {
+        try {
+          res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
+          res.end('error');
+        } catch {}
+      }
+    });
+    await new Promise((resolve) => clientServer.listen(port, '127.0.0.1', resolve));
+    context.subscriptions.push({ dispose: () => { try { clientServer && clientServer.close(); } catch {} } });
+    return { port };
+  }
+
   const openPreviewCmd = vscode.commands.registerCommand('tailwindPreview.openPreview', async () => {
     const editor = vscode.window.activeTextEditor;
     if (!editor || editor.document.languageId !== 'html') {
@@ -79,6 +152,8 @@ function activate(context) {
             vscode.window.showErrorMessage('Failed to apply Tailwind class edit to source.');
             return;
           }
+          // Auto-save the edited document
+          try { await doc.save(); } catch {}
           // Update our record to the new value so subsequent edits validate correctly
           classOffsetMap.set(String(uid), { ...info, original: newValue });
         } else if (msg.type === 'updateDynamicTemplate') {
@@ -156,7 +231,18 @@ function activate(context) {
 
           if (changed.size > 0) {
             const ok = await vscode.workspace.applyEdit(edits);
-            if (!ok) vscode.window.showErrorMessage('Failed to update dynamic class template in source.');
+            if (!ok) {
+              vscode.window.showErrorMessage('Failed to update dynamic class template in source.');
+            } else {
+              // Auto-save each changed file
+              for (const uriStr of changed) {
+                try {
+                  const uri = vscode.Uri.parse(uriStr);
+                  const docToSave = await vscode.workspace.openTextDocument(uri);
+                  await docToSave.save();
+                } catch {}
+              }
+            }
           }
         }
       } catch (e) {
@@ -167,6 +253,67 @@ function activate(context) {
   });
 
   context.subscriptions.push(openPreviewCmd);
+
+  const openServerPreviewCmd = vscode.commands.registerCommand('tailwindPreview.openServerPreview', async () => {
+    try {
+      const { port } = await getOrStartClientServer();
+
+      // Ask for server URL (default vite port)
+      const lastUrl = context.globalState.get('tailwindPreview.serverUrl') || 'http://localhost:5173/';
+      const serverUrl = await vscode.window.showInputBox({
+        title: 'Enter dev server URL (Vite, etc.)',
+        value: lastUrl,
+        prompt: 'Example: http://localhost:5173/',
+        validateInput: (val) => {
+          try { new URL(val); return ''; } catch { return 'Invalid URL'; }
+        }
+      });
+      if (!serverUrl) return;
+      context.globalState.update('tailwindPreview.serverUrl', serverUrl);
+
+      const panel = vscode.window.createWebviewPanel(
+        'tailwindPreviewServer',
+        `Tailwind Server Preview`,
+        vscode.ViewColumn.Beside,
+        { enableScripts: true, retainContextWhenHidden: true }
+      );
+
+      const iframeUrl = serverUrl;
+      const clientUrl = `http://127.0.0.1:${port}/twv-client.js`;
+      panel.webview.html = buildServerPreviewHtml(panel.webview, iframeUrl, clientUrl);
+
+      panel.webview.onDidReceiveMessage(async (msg) => {
+        try {
+          if (!msg || !msg.type) return;
+          if (msg.type === 'copyToClipboard' && typeof msg.text === 'string') {
+            try {
+              await vscode.env.clipboard.writeText(msg.text);
+              vscode.window.showInformationMessage('Copied script tag to clipboard.');
+            } catch (e) {
+              vscode.window.showErrorMessage('Failed to copy to clipboard.');
+            }
+            return;
+          }
+          if (msg.type === 'serverUpdateClasses' || msg.type === 'serverUpdateDynamicTemplate' || msg.type === 'updateDynamicTemplate') {
+            const before = (msg && typeof msg.before === 'string') ? msg.before : '';
+            const after = (msg && typeof msg.after === 'string') ? msg.after : '';
+            if (!before || !after || before === after) return;
+            const changedCount = await persistDynamicClassEditSmart(before, after);
+            if (changedCount >= 0) {
+              vscode.window.showInformationMessage(`Updated and saved ${changedCount} file(s) with new Tailwind classes.`);
+            }
+          }
+        } catch (e) {
+          console.error('server preview message error', e);
+        }
+      });
+    } catch (e) {
+      vscode.window.showErrorMessage('Failed to open server preview. See console for details.');
+      console.error(e);
+    }
+  });
+
+  context.subscriptions.push(openServerPreviewCmd);
 
   // Update context key when active editor changes or doc content changes
   const updateContextForEditor = (editor) => {
@@ -244,7 +391,7 @@ function preparePreviewHtml(webview, docUri, sourceHtml) {
   const hasHead = /<head[^>]*>/i.test(html);
   const hasBase = /<base\s+href=/i.test(html);
 
-  const cspMeta = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} https: data:; media-src ${webview.cspSource} https:; style-src 'unsafe-inline' ${webview.cspSource} https:; script-src 'unsafe-inline' 'unsafe-eval' ${webview.cspSource} https:; font-src ${webview.cspSource} https: data:; connect-src ${webview.cspSource} https:; frame-src ${webview.cspSource} https:;">`;
+  const cspMeta = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} http: https: data:; media-src ${webview.cspSource} http: https:; style-src 'unsafe-inline' ${webview.cspSource} http: https:; script-src 'unsafe-inline' 'unsafe-eval' ${webview.cspSource} http: https:; font-src ${webview.cspSource} http: https: data:; connect-src ${webview.cspSource} http: https:; frame-src ${webview.cspSource} http: https:;">`;
   const baseTag = `<base href="${baseHref}/">`;
 
   if (hasHead) {
@@ -691,6 +838,293 @@ function annotateHtmlForClassOffsets(sourceHtml) {
     // Fallback: no annotation
     return { annotatedHtml: sourceHtml, mapping: new Map() };
   }
+}
+
+// Build a webview page that embeds an iframe to a dev server and relays messages.
+function buildServerPreviewHtml(webview, iframeUrl, clientScriptUrl) {
+  const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} http: https: data:; media-src ${webview.cspSource} http: https:; style-src 'unsafe-inline' ${webview.cspSource} http: https:; script-src 'unsafe-inline' 'unsafe-eval' ${webview.cspSource} http: https:; font-src ${webview.cspSource} http: https: data:; connect-src ${webview.cspSource} http: https:; frame-src ${webview.cspSource} http: https:;">`;
+  const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const html = `<!doctype html>
+<html>
+  <head>
+    ${csp}
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tailwind Server Preview</title>
+    <style>
+      html, body { height: 100%; }
+      body { margin: 0; font: 12px/1.4 -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; color: #111827; }
+      #bar { display:flex; align-items:center; gap:8px; padding:6px 8px; background:#f1f5f9; border-bottom:1px solid #e2e8f0; }
+      #bar input { flex: 1 1 auto; padding:6px 8px; border:1px solid #cbd5e1; border-radius:6px; font-size:12px; }
+      #bar button { padding:6px 10px; font-size:12px; border:1px solid #cbd5e1; border-radius:6px; background:white; cursor:pointer; }
+      #bar button.active { background:#0ea5e9; color:white; border-color:#0284c7; }
+      #bar .hint { color:#475569; }
+      #frame { width: 100%; height: calc(100% - 40px); border:0; }
+      #warn { padding: 8px; background: #fff7ed; border-top: 1px solid #fde68a; color: #7c2d12; display:none; }
+    </style>
+  </head>
+  <body>
+    <div id="bar">
+      <span class="hint">URL:</span>
+      <input id="url" value="${esc(iframeUrl)}" />
+      <button id="go">Reload</button>
+      <button id="copy">Copy Client Script Tag</button>
+      <button id="pause" title="Pause interactions (p)">Pause</button>
+      <span class="hint">Client:</span>
+      <code id="client">${esc(clientScriptUrl)}</code>
+    </div>
+    <iframe id="frame" src="${esc(iframeUrl)}"></iframe>
+    <div id="warn"></div>
+    <script>
+      const vscode = (typeof acquireVsCodeApi === 'function') ? acquireVsCodeApi() : null;
+      const input = document.getElementById('url');
+      const btn = document.getElementById('go');
+      const copy = document.getElementById('copy');
+      const client = document.getElementById('client');
+      const warn = document.getElementById('warn');
+      const iframe = document.getElementById('frame');
+      const pauseBtn = document.getElementById('pause');
+      let paused = false;
+      btn.onclick = () => { try { const u = new URL(input.value); iframe.src = u.toString(); warn.style.display='none'; } catch { alert('Invalid URL'); } };
+      copy.onclick = async () => {
+        const tag = '<script src="${esc(clientScriptUrl)}"><' + '/script>';
+        try {
+          if (vscode) {
+            vscode.postMessage({ type: 'copyToClipboard', text: tag });
+          } else if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(tag);
+            alert('Copied script tag to clipboard.');
+          } else {
+            throw new Error('no clipboard api');
+          }
+        } catch (_) {
+          try { await navigator.clipboard.writeText(tag); alert('Copied script tag to clipboard.'); } catch { prompt('Copy this tag:', tag); }
+        }
+      };
+      function updatePauseButton(){ pauseBtn.textContent = paused ? 'Resume' : 'Pause'; pauseBtn.classList.toggle('active', paused); }
+      function sendPause(){ try { iframe && iframe.contentWindow && iframe.contentWindow.postMessage({ source:'twv-host', type:'setPaused', value: paused }, '*'); } catch(_){} }
+      pauseBtn.onclick = () => { paused = !paused; updatePauseButton(); sendPause(); };
+      window.addEventListener('keydown', (e) => { if ((e.key==='p'||e.key==='P') && !(e.metaKey||e.ctrlKey||e.altKey||e.shiftKey)) { e.preventDefault(); paused = !paused; updatePauseButton(); sendPause(); } });
+      updatePauseButton();
+
+      // Relay messages from iframe client to the extension
+      window.addEventListener('message', (ev) => {
+        try {
+          if (!iframe || ev.source !== iframe.contentWindow) return;
+          const data = ev.data || {};
+          if (data && data.source === 'twv-client' && data.type) {
+            if (vscode) vscode.postMessage({ type: 'serverUpdateDynamicTemplate', before: data.before || '', after: data.after || '' });
+          }
+        } catch (e) { console.error('message relay error', e); }
+      });
+
+      // Show a note if the site refuses to be framed
+      iframe.addEventListener('load', () => { warn.style.display='none'; sendPause(); });
+      iframe.addEventListener('error', () => { warn.textContent = 'The app refused to load in an <iframe> (X-Frame-Options/Content-Security-Policy). Disable these in dev to use Server Preview.'; warn.style.display='block'; });
+    </script>
+  </body>
+</html>`;
+  return html;
+}
+
+// Workspace-wide persistence: replace exact string-literal occurrences of `before` with `after` in common web files.
+async function persistDynamicClassEditWorkspace(before, after) {
+  try {
+    const vscode = require('vscode');
+    const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const dqRe = new RegExp('"' + escapeRe(before) + '"', 'g');
+    const sqRe = new RegExp("'" + escapeRe(before) + "'", 'g');
+    const btRe = new RegExp('`' + escapeRe(before) + '`', 'g');
+    const files = await vscode.workspace.findFiles('**/*.{html,js,jsx,ts,tsx,vue,svelte,astro}', '**/{node_modules,dist,build,.next,.nuxt,out,coverage,.git}/**', 5000);
+    let changedFiles = 0;
+    const edit = new vscode.WorkspaceEdit();
+    const toSave = [];
+    for (const uri of files) {
+      try {
+        const buf = await vscode.workspace.fs.readFile(uri);
+        const text = Buffer.from(buf).toString('utf8');
+        const replaced = text.replace(dqRe, '"' + after + '"').replace(sqRe, "'" + after + "'").replace(btRe, '`' + after + '`');
+        if (replaced !== text) {
+          const doc = await vscode.workspace.openTextDocument(uri);
+          const full = new vscode.Range(doc.positionAt(0), doc.positionAt(text.length));
+          edit.replace(uri, full, replaced);
+          changedFiles++;
+          toSave.push(uri);
+        }
+      } catch {}
+    }
+    if (changedFiles > 0) {
+      const ok = await vscode.workspace.applyEdit(edit);
+      if (ok) {
+        for (const uri of toSave) {
+          try { const doc = await vscode.workspace.openTextDocument(uri); await doc.save(); } catch {}
+        }
+      }
+    }
+    return changedFiles;
+  } catch (e) {
+    console.error('persistDynamicClassEditWorkspace error', e);
+    return 0;
+  }
+}
+
+// Smart persistence for server preview edits:
+// - Scan workspace for occurrences of the class string in string literals
+// - If exactly one file contains matches, update and save it automatically
+// - If multiple files contain matches, prompt the user to pick which files to update
+async function persistDynamicClassEditSmart(before, after) {
+  try {
+    const vscode = require('vscode');
+    const path = require('path');
+    const folders = vscode.workspace.workspaceFolders || [];
+    const toRel = (uri) => {
+      if (!folders.length) return uri.fsPath || uri.path || uri.toString();
+      for (const f of folders) {
+        if (uri.fsPath && uri.fsPath.startsWith(f.uri.fsPath + path.sep)) {
+          return path.relative(f.uri.fsPath, uri.fsPath);
+        }
+      }
+      return uri.fsPath || uri.path || uri.toString();
+    };
+
+    const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const dqRe = new RegExp('"' + escapeRe(before) + '"', 'g');
+    const sqRe = new RegExp("'" + escapeRe(before) + "'", 'g');
+    const btRe = new RegExp('`' + escapeRe(before) + '`', 'g');
+    const files = await vscode.workspace.findFiles('**/*.{html,js,jsx,ts,tsx,vue,svelte,astro}', '**/{node_modules,dist,build,.next,.nuxt,out,coverage,.git}/**', 5000);
+    const matches = [];
+    for (const uri of files) {
+      try {
+        const buf = await vscode.workspace.fs.readFile(uri);
+        const text = Buffer.from(buf).toString('utf8');
+        const count = (text.match(dqRe)?.length || 0) + (text.match(sqRe)?.length || 0) + (text.match(btRe)?.length || 0);
+        if (count > 0) {
+          matches.push({ uri, text, count });
+        }
+      } catch {}
+    }
+
+    if (matches.length === 0) {
+      vscode.window.showInformationMessage('No matching class string found to persist.');
+      return 0;
+    }
+
+    if (matches.length === 1) {
+      const m = matches[0];
+      const doc = await vscode.workspace.openTextDocument(m.uri);
+      const replaced = doc.getText().replace(dqRe, '"' + after + '"').replace(sqRe, "'" + after + "'").replace(btRe, '`' + after + '`');
+      if (replaced !== doc.getText()) {
+        const edit = new vscode.WorkspaceEdit();
+        const full = new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length));
+        edit.replace(m.uri, full, replaced);
+        const ok = await vscode.workspace.applyEdit(edit);
+        if (ok) { try { await doc.save(); } catch {} }
+        return ok ? 1 : 0;
+      }
+      return 0;
+    }
+
+    // Multiple files: let the user choose
+    const picks = await vscode.window.showQuickPick(
+      matches.map((m) => ({ label: toRel(m.uri), description: `${m.count} match(es)`, m })),
+      { canPickMany: true, placeHolder: 'Multiple files contain this class string. Select files to update, or Esc to cancel.' }
+    );
+    if (!picks || picks.length === 0) return -1; // cancelled
+
+    let changed = 0;
+    for (const p of picks) {
+      const m = p.m;
+      try {
+        const doc = await vscode.workspace.openTextDocument(m.uri);
+        const text = doc.getText();
+        const replaced = text.replace(dqRe, '"' + after + '"').replace(sqRe, "'" + after + "'").replace(btRe, '`' + after + '`');
+        if (replaced !== text) {
+          const edit = new vscode.WorkspaceEdit();
+          const full = new vscode.Range(doc.positionAt(0), doc.positionAt(text.length));
+          edit.replace(m.uri, full, replaced);
+          const ok = await vscode.workspace.applyEdit(edit);
+          if (ok) { try { await doc.save(); } catch {} changed++; }
+        }
+      } catch {}
+    }
+    return changed;
+  } catch (e) {
+    console.error('persistDynamicClassEditSmart error', e);
+    return 0;
+  }
+}
+
+// Remote client helper JS: runs inside the dev server page, overlays hover/tooltip, edits classes,
+// and posts updates to the parent (the webview) for workspace persistence.
+function getRemoteClientScript() {
+  return "(()=>{"+
+    "try {"+
+      "const d = document;"+
+      "if (d.getElementById('twv-remote-client')) return;"+
+      "const style = d.createElement('style'); style.id = 'twv-remote-client'; style.textContent = '"+
+        "#twv-hover-outline { position: fixed; pointer-events: none; z-index: 2147483646; border: 2px solid #06b6d4; border-radius: 2px; box-shadow: 0 0 0 2px rgba(6,182,212,0.25); }"+
+        "#twv-tooltip { position: fixed; pointer-events: none; z-index: 2147483647; background: rgba(3, 7, 18, 0.9); color: #e5e7eb; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \\\"Liberation Mono\\\", \\\"Courier New\\\", monospace; font-size: 12px; padding: 6px 8px; border-radius: 6px; max-width: 70vw; white-space: pre-wrap; line-height: 1.3; box-shadow: 0 2px 8px rgba(0,0,0,0.35); }"+
+        "#twv-tooltip .twv-tag { color: #93c5fd; }"+
+        "#twv-tooltip .twv-classes { color: #fde68a; }"+
+        "#twv-tooltip .twv-none { color: #9ca3af; font-style: italic; }"+
+        "#twv-tooltip.hidden, #twv-hover-outline.hidden { display: none; }"+
+        "#twv-editor { position: fixed; z-index: 2147483647; background: #0b1220; color: #e5e7eb; padding: 10px; border-radius: 8px; box-shadow: 0 10px 30px rgba(0,0,0,0.45); width: min(80vw, 720px); max-width: 720px; border: 1px solid #334155; }"+
+        "#twv-editor textarea { width: 100%; min-height: 42px; resize: vertical; font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \\\"Liberation Mono\\\", \\\"Courier New\\\", monospace; padding: 8px; border-radius: 6px; border: 1px solid #334155; background: #0f172a; color: #e5e7eb; }"+
+        "#twv-editor .twv-actions { margin-top: 8px; display: flex; gap: 8px; justify-content: flex-end; }"+
+        "#twv-editor .twv-actions button { padding: 6px 10px; font-size: 12px; border: 1px solid #334155; border-radius: 6px; background: #111827; color: #e5e7eb; cursor: pointer; }"+
+        "#twv-shield { position: fixed; inset: 0; z-index: 2147483630; pointer-events: none; }"+
+        "html.twv-paused { cursor: default !important; }"+
+      "'; d.documentElement.appendChild(style);"+
+      "const outline = d.createElement('div'); outline.id = 'twv-hover-outline'; outline.className='hidden'; d.documentElement.appendChild(outline);"+
+      "const tooltip = d.createElement('div'); tooltip.id = 'twv-tooltip'; tooltip.className='hidden'; d.documentElement.appendChild(tooltip);"+
+      "const editor = d.createElement('div'); editor.id = 'twv-editor'; editor.style.display = 'none';"+
+      "editor.innerHTML = '<div id=\\\"twv-title\\\" style=\\\"margin-bottom:6px;color:#9ca3af\\\">Edit Tailwind classes</div>'+"+
+        "'<textarea id=\\\"twv-input\\\" spellcheck=\\\"false\\\" rows=\\\"1\\\" wrap=\\\"soft\\\" aria-label=\\\"Tailwind classes\\\"></textarea>'+"+
+        "'<div class=\\\"twv-actions\\\"><button class=\\\"twv-cancel\\\">Cancel</button><button class=\\\"twv-save\\\">Save</button></div>';"+
+      "d.documentElement.appendChild(editor);"+
+      "const input = editor.querySelector('#twv-input');"+
+      "const btnSave = editor.querySelector('.twv-save');"+
+      "const btnCancel = editor.querySelector('.twv-cancel');"+
+      
+      "function updateUI(target, x, y) {"+
+        "if (!(target instanceof Element)) { outline.classList.add('hidden'); tooltip.classList.add('hidden'); return; }"+
+        "const rect = target.getBoundingClientRect();"+
+        "outline.style.left = rect.left + 'px'; outline.style.top = rect.top + 'px'; outline.style.width = rect.width + 'px'; outline.style.height = rect.height + 'px'; outline.classList.remove('hidden');"+
+        "const classes = Array.from(target.classList || []);"+
+        "const tag = target.tagName.toLowerCase(); const id = target.id ? '#' + target.id : '';"+
+        "const clsStr = classes.length ? classes.join(' ') : '';"+
+        "tooltip.innerHTML = '<span class=\\\"twv-tag\\\">' + tag + id + '</span>' + (clsStr ? ' · <span class=\\\"twv-classes\\\">' + clsStr.replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</span>' : ' · <span class=\\\"twv-none\\\">no classes</span>');"+
+        "const tw = tooltip.getBoundingClientRect().width; const th = tooltip.getBoundingClientRect().height; let tx = x + 12; let ty = y + 12; const vw = window.innerWidth; const vh = window.innerHeight; if (tx + tw + 8 > vw) tx = Math.max(8, vw - tw - 8); if (ty + th + 8 > vh) ty = Math.max(8, vh - th - 8);"+
+        "tooltip.style.left = tx + 'px'; tooltip.style.top = ty + 'px'; tooltip.classList.remove('hidden');"+
+      "}"+
+      "function hideUI(){ outline.classList.add('hidden'); tooltip.classList.add('hidden'); }"+
+      
+      "let lastEl = null;"+
+      "d.addEventListener('mousemove', (e) => { const el = e.target; if (!(el instanceof Element)) { hideUI(); return; } if (el !== lastEl) lastEl = el; updateUI(el, e.clientX, e.clientY); }, { capture: true });"+
+      "d.addEventListener('mouseleave', hideUI, { capture: true });"+
+      "const shield = d.createElement('div'); shield.id = 'twv-shield'; d.documentElement.appendChild(shield);"+
+      "let paused = false; function setPaused(on){ paused = !!on; d.documentElement.classList.toggle('twv-paused', paused); }"+
+      "window.addEventListener('message', (ev) => { try { const data = ev.data || {}; if (data && data.source === 'twv-host' && data.type === 'setPaused') setPaused(!!data.value); } catch(_){} });"+
+      
+      "function openEditorFor(el, x, y) {"+
+        "const cur = (el.getAttribute('class') || '').trim();"+
+        "input.value = cur; editor.style.display = 'block'; editor.style.transform = 'none'; input.focus(); try { input.setSelectionRange(cur.length, cur.length); } catch(_) {}"+
+        "const target = el.getBoundingClientRect(); const vw = window.innerWidth; const vh = window.innerHeight; let r = editor.getBoundingClientRect();"+
+        "let ex = (typeof x === 'number' ? x : (target.left + target.right)/2) - r.width/2; ex = Math.max(8, Math.min(vw - r.width - 8, ex));"+
+        "let below = (typeof y === 'number' ? y : target.bottom) + 12; let above = (typeof y === 'number' ? y : target.top) - r.height - 12; let ey = below; if (ey + r.height + 8 > vh && above >= 8) ey = Math.max(8, above); ey = Math.max(8, Math.min(vh - r.height - 8, ey));"+
+        "editor.style.left = ex + 'px'; editor.style.top = ey + 'px';"+
+        "function autosize(){ input.style.height = 'auto'; input.style.height = Math.min(280, input.scrollHeight + 2) + 'px'; r = editor.getBoundingClientRect(); let ny = r.top; if (r.bottom > vh - 8) ny = Math.max(8, vh - 8 - r.height); editor.style.top = ny + 'px'; }"+
+        "autosize(); input.addEventListener('input', autosize); window.addEventListener('resize', autosize, { passive: true });"+
+        "function close(){ editor.style.display = 'none'; input.removeEventListener('input', autosize); d.removeEventListener('keydown', onKey, true); }"+
+        "async function commit(){ const before = cur; const after = (input.value || '').trim(); el.setAttribute('class', after); try { window.parent && window.parent.postMessage({ source:'twv-client', type:'update', before: before, after: after }, '*'); } catch(e){} close(); }"+
+        "function onKey(ev){ if (ev.key === 'Escape') { ev.preventDefault(); close(); } if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey || !ev.shiftKey)) { ev.preventDefault(); commit(); } }"+
+        "d.addEventListener('keydown', onKey, { capture:true }); btnCancel.onclick = (ev) => { ev.preventDefault(); close(); }; btnSave.onclick = (ev) => { ev.preventDefault(); commit(); };"+
+      "}"+
+      "d.addEventListener('dblclick', (e) => { const t = e.target; if (t && t.closest && t.closest('#twv-editor')) return; if (!(t instanceof Element)) return; e.preventDefault(); e.stopPropagation(); openEditorFor(t, e.clientX, e.clientY); }, { capture: true });"+
+      "const swallow = (ev) => { if (!paused) return; const path = ev.composedPath ? ev.composedPath() : []; const t = ev.target; const inEditor = (n) => !!n && (n.id === 'twv-editor' || (n.closest && n.closest('#twv-editor'))); if (inEditor(t) || (Array.isArray(path) && path.some(inEditor))) return; ev.stopImmediatePropagation(); ev.preventDefault(); };"+
+      "['click','dblclick','mousedown','mouseup','pointerdown','pointerup','pointermove','mousemove','contextmenu','touchstart','touchend','dragstart','dragover','drop','mouseover','mouseout','mouseenter','mouseleave'].forEach(t => { d.addEventListener(t, swallow, { capture: true }); });"+
+    "} catch (e) { console.error('twv remote client error', e); }"+
+  "})();";
 }
 
 function deactivate() {}
