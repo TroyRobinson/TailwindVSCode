@@ -125,10 +125,14 @@ function activate(context) {
     });
     panel.onDidDispose(() => saveSub.dispose());
 
-    // Handle class updates and undo/redo from the preview
+    // Handle class updates, undo/redo, and clipboard from the preview
     panel.webview.onDidReceiveMessage(async (msg) => {
       try {
         if (!msg || !msg.type) return;
+        if (msg.type === 'twvClipboardWrite' && typeof msg.text === 'string') {
+          try { await vscode.env.clipboard.writeText(msg.text); } catch {}
+          return;
+        }
         if (msg.type === 'undo' || msg.type === 'redo') {
           try {
             // Bring the source document to the foreground, run undo/redo, save, then re-focus preview
@@ -318,6 +322,10 @@ function activate(context) {
       panel.webview.onDidReceiveMessage(async (msg) => {
         try {
           if (!msg || !msg.type) return;
+          if (msg.type === 'twvClipboardWrite' && typeof msg.text === 'string') {
+            try { await vscode.env.clipboard.writeText(msg.text); } catch {}
+            return;
+          }
           if (msg.type === 'serverUndo' || msg.type === 'serverRedo') {
             try {
               // Prefer undo/redo on the last touched document
@@ -539,6 +547,21 @@ function getHelperScript() {
       const titleEl = editor.querySelector('#twv-title');
       const btnSave = editor.querySelector('.twv-save');
       const btnCancel = editor.querySelector('.twv-cancel');
+      // Common editing shortcuts inside textarea (select/copy/cut/undo/redo)
+      try {
+        input.addEventListener('keydown', (ev) => {
+          try {
+            const k = String(ev.key || '').toLowerCase();
+            const mod = !!(ev.metaKey || ev.ctrlKey);
+            if (!mod) return;
+            if (k === 'a') { ev.preventDefault(); ev.stopPropagation(); try { input.select(); } catch(_) {} return; }
+            if (k === 'c') { ev.preventDefault(); ev.stopPropagation(); let ok=false; try { ok = !!document.execCommand('copy'); } catch(_) {} if (!ok && vscodeApi) { try { const s = input.selectionStart|0; const e = input.selectionEnd|0; const txt = (e> s) ? input.value.slice(s, e) : String(input.value||''); vscodeApi.postMessage({ type: 'twvClipboardWrite', text: txt }); } catch(_) {} } return; }
+            if (k === 'x') { ev.preventDefault(); ev.stopPropagation(); let ok=false; try { ok = !!document.execCommand('cut'); } catch(_) {} if (!ok && vscodeApi) { try { const s = input.selectionStart|0; const e = input.selectionEnd|0; if (e> s) { const txt = input.value.slice(s, e); vscodeApi.postMessage({ type: 'twvClipboardWrite', text: txt }); input.value = input.value.slice(0, s) + input.value.slice(e); input.dispatchEvent(new Event('input', { bubbles: true })); } } catch(_) {} } return; }
+            if (k === 'z') { ev.preventDefault(); ev.stopPropagation(); try { document.execCommand(ev.shiftKey ? 'redo' : 'undo'); } catch(_) {} return; }
+            if (k === 'y') { ev.preventDefault(); ev.stopPropagation(); try { document.execCommand('redo'); } catch(_) {} return; }
+          } catch(_) {}
+        }, { capture: true });
+      } catch(_) {}
       const vscodeApi = (typeof acquireVsCodeApi === 'function') ? acquireVsCodeApi() : null;
 
       // Runtime class template rules: when a dynamic element is edited (no source uid),
@@ -791,16 +814,7 @@ function getHelperScript() {
             // Enter without Shift commits; Shift+Enter inserts newline
             if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey || !ev.shiftKey)) { ev.preventDefault(); commit(); }
           }
-          // Ensure Cmd/Ctrl+Z acts on the textarea when focused
-          input.addEventListener('keydown', (ev) => {
-            try {
-              const k = String(ev.key || '').toLowerCase();
-              const meta = !!(ev.metaKey || ev.ctrlKey);
-              if (!meta || k !== 'z') return;
-              ev.preventDefault(); ev.stopPropagation();
-              try { document.execCommand(ev.shiftKey ? 'redo' : 'undo'); } catch(_) {}
-            } catch(_) {}
-          }, { capture: true });
+          // Editing shortcuts handled by input-level keydown listener above
           d.addEventListener('keydown', onKey, { capture: true });
           btnCancel.onclick = (ev) => { ev.preventDefault(); close(); };
           btnSave.onclick = (ev) => { ev.preventDefault(); commit(); };
@@ -1072,6 +1086,8 @@ function buildServerPreviewHtml(webview, iframeUrl, clientScriptUrl) {
             if (!vscode) return;
             if (data.type === 'undo' || data.type === 'redo') {
               vscode.postMessage({ type: data.type === 'undo' ? 'serverUndo' : 'serverRedo' });
+            } else if (data.type === 'clipboardWrite') {
+              vscode.postMessage({ type: 'twvClipboardWrite', text: data.text || '' });
             } else {
               vscode.postMessage({ type: 'serverUpdateDynamicTemplate', before: data.before || '', after: data.after || '', text: data.text || '', tag: data.tag || '', id: data.id || '' });
             }
@@ -1474,6 +1490,8 @@ function getRemoteClientScript() {
       "const input = editor.querySelector('#twv-input');"+
       "const btnSave = editor.querySelector('.twv-save');"+
       "const btnCancel = editor.querySelector('.twv-cancel');"+
+      // Common editing shortcuts inside textarea (select/copy/cut/undo/redo) with clipboard fallback
+      "try { input.addEventListener('keydown', function(ev){ try { const k = String(ev.key||'').toLowerCase(); const mod = !!(ev.metaKey||ev.ctrlKey); if (!mod) return; if (k==='a'){ ev.preventDefault(); ev.stopPropagation(); try{ input.select(); }catch(_){} return; } if (k==='c'){ ev.preventDefault(); ev.stopPropagation(); var ok=false; try{ ok = !!document.execCommand('copy'); }catch(_){} if (!ok) { try { var s = (input.selectionStart|0), e = (input.selectionEnd|0); var txt = (e>s) ? input.value.slice(s,e) : String(input.value||''); window.parent && window.parent.postMessage({ source:'twv-client', type:'clipboardWrite', text: txt }, '*'); } catch(_){} } return; } if (k==='x'){ ev.preventDefault(); ev.stopPropagation(); var ok=false; try{ ok = !!document.execCommand('cut'); }catch(_){} if (!ok) { try { var s = (input.selectionStart|0), e = (input.selectionEnd|0); if (e>s) { var txt = input.value.slice(s,e); window.parent && window.parent.postMessage({ source:'twv-client', type:'clipboardWrite', text: txt }, '*'); input.value = input.value.slice(0,s) + input.value.slice(e); input.dispatchEvent(new Event('input', { bubbles:true })); } } catch(_){} } return; } if (k==='z'){ ev.preventDefault(); ev.stopPropagation(); try{ document.execCommand(ev.shiftKey ? 'redo' : 'undo'); }catch(_){} return; } if (k==='y'){ ev.preventDefault(); ev.stopPropagation(); try{ document.execCommand('redo'); }catch(_){} return; } } catch(_){} }, { capture: true }); } catch(_){}"+
       
       "function updateUI(target, x, y) {"+
         "if (!(target instanceof Element)) { outline.classList.add('hidden'); tooltip.classList.add('hidden'); return; }"+
