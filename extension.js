@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-var-requires */
 const vscode = require('vscode');
 const path = require('path');
+let parse5 = null; // lazy-loaded for preview mapping
 
 /**
  * @param {vscode.ExtensionContext} context
@@ -122,7 +123,7 @@ function activate(context) {
     panel.onDidDispose(() => saveSub.dispose());
 
     // Handle class updates from the preview
-    panel.webview.onDidReceiveMessage(async (msg) => {
+  panel.webview.onDidReceiveMessage(async (msg) => {
       try {
         if (!msg || !msg.type) return;
         if (msg.type === 'updateClasses') {
@@ -154,8 +155,23 @@ function activate(context) {
           }
           // Auto-save the edited document
           try { await doc.save(); } catch {}
-          // Update our record to the new value so subsequent edits validate correctly
-          classOffsetMap.set(String(uid), { ...info, original: newValue });
+          // Update our mapping in-memory to reflect the new lengths so follow-up edits work pre-save
+          try {
+            const oldLen = (info.end - info.start);
+            const newLen = newValue.length;
+            const delta = newLen - oldLen;
+            const updated = { ...info, original: newValue, end: info.start + newLen };
+            classOffsetMap.set(String(uid), updated);
+            if (delta !== 0) {
+              // Shift subsequent offsets appearing after this range
+              for (const [k, v] of classOffsetMap.entries()) {
+                if (k === String(uid)) continue;
+                if (typeof v.start === 'number' && v.start > info.end) {
+                  classOffsetMap.set(k, { ...v, start: v.start + delta, end: v.end + delta });
+                }
+              }
+            }
+          } catch {}
         } else if (msg.type === 'updateDynamicTemplate') {
           const before = (msg && typeof msg.before === 'string') ? msg.before : '';
           const after = (msg && typeof msg.after === 'string') ? msg.after : '';
@@ -298,9 +314,11 @@ function activate(context) {
             const before = (msg && typeof msg.before === 'string') ? msg.before : '';
             const after = (msg && typeof msg.after === 'string') ? msg.after : '';
             if (!before || !after || before === after) return;
-            const changedCount = await persistDynamicClassEditSmart(before, after);
-            if (changedCount >= 0) {
+            const changedCount = await persistDynamicClassEditSmart(before, after, { text: (msg && typeof msg.text === 'string') ? msg.text : '', tag: (msg && typeof msg.tag === 'string') ? msg.tag : '', id: (msg && typeof msg.id === 'string') ? msg.id : '' });
+            if (changedCount > 0) {
               vscode.window.showInformationMessage(`Updated and saved ${changedCount} file(s) with new Tailwind classes.`);
+            } else if (changedCount === 0) {
+              vscode.window.showInformationMessage('No matching class string found to persist. The classes may be composed dynamically; try editing the template/HTML or ensure the exact class string exists in a string literal.');
             }
           }
         } catch (e) {
@@ -785,58 +803,123 @@ function getHelperScript() {
 // Annotate the HTML source by adding data-twv-uid to elements with a class attribute
 // and compute a mapping of uid -> { start, end, original }
 function annotateHtmlForClassOffsets(sourceHtml) {
+  // Prefer robust parse5-based mapping. Fallback to regex approach on failure.
   try {
+    if (!parse5) {
+      try { parse5 = require('parse5'); } catch (e) { parse5 = null; }
+    }
+    if (!parse5) throw new Error('parse5 not available');
+
+    const doc = parse5.parse(sourceHtml, { sourceCodeLocationInfo: true });
     const mapping = new Map();
-    let out = '';
-    let last = 0;
     let uidCounter = 1;
 
-    const tagRe = /<([a-zA-Z][\w:-]*)([^>]*)>/g; // start tags (simple heuristic)
-    let m;
-    while ((m = tagRe.exec(sourceHtml)) !== null) {
-      const full = m[0];
-      const tagName = m[1];
-      const attrs = m[2] || '';
-      // Ignore closing or doctype etc (already filtered by regex)
+    /** @param {any} node */
+    const visit = (node) => {
+      if (node && Array.isArray(node.childNodes)) {
+        for (const child of node.childNodes) visit(child);
+      }
+      if (!node || !Array.isArray(node.attrs) || !node.sourceCodeLocation) return;
 
-      // Find class attribute in attrs
-      const classRe = /\bclass\s*=\s*(["'])([\s\S]*?)\1/i; // match quoted value, don't cross tag because attrs excludes '>'
-      const cm = classRe.exec(attrs);
-      if (!cm) continue;
+      const hasClassAttr = node.attrs.find((a) => a.name === 'class');
+      const locs = node.sourceCodeLocation.attrs || {};
+      const classLoc = locs['class'];
+      if (!hasClassAttr || !classLoc) return;
 
-      // Compute offsets for the class value inside the document
-      const quote = cm[1];
-      const classValue = cm[2];
-      const attrsStartInFull = 1 + tagName.length; // after '<tag'
-      // Position of the opening quote within attrs string
-      const openQuoteInAttrs = cm.index + (cm[0].indexOf(quote));
-      const valueStartInAttrs = openQuoteInAttrs + 1;
-      const valueEndInAttrs = valueStartInAttrs + classValue.length;
+      // Compute value start/end offsets within original source for this class attribute
+      const valueOffsets = computeAttrValueOffsetsFromSpan(sourceHtml, classLoc.startOffset, classLoc.endOffset);
+      if (!valueOffsets) return;
+      const { valueStart, valueEnd } = valueOffsets;
+      const classValue = sourceHtml.slice(valueStart, valueEnd);
 
-      const tagStartInDoc = m.index;
-      const valueStartInDoc = tagStartInDoc + attrsStartInFull + valueStartInAttrs;
-      const valueEndInDoc = tagStartInDoc + attrsStartInFull + valueEndInAttrs;
+      // Ensure a clean data-twv-uid attribute on this node in the preview
+      node.attrs = node.attrs.filter((a) => a.name !== 'data-twv-uid');
+      node.attrs.push({ name: 'data-twv-uid', value: String(uidCounter) });
 
-      // Inject data-twv-uid before the closing '>' (or '/>')
-      const closeIsSelf = /\/>\s*$/.test(full);
-      const injection = ` data-twv-uid="${uidCounter}"`;
-      const insertPosInFull = full.length - (closeIsSelf ? 2 : 1);
-      const newStartTag = full.slice(0, insertPosInFull) + injection + full.slice(insertPosInFull);
-
-      // Append replaced segment to output
-      out += sourceHtml.slice(last, tagStartInDoc) + newStartTag;
-      last = tagStartInDoc + full.length;
-
-      mapping.set(String(uidCounter), { start: valueStartInDoc, end: valueEndInDoc, original: classValue });
+      mapping.set(String(uidCounter), { start: valueStart, end: valueEnd, original: classValue });
       uidCounter++;
-    }
+    };
+    visit(doc);
 
-    out += sourceHtml.slice(last);
-    return { annotatedHtml: out, mapping };
+    const annotatedHtml = parse5.serialize(doc);
+    return { annotatedHtml, mapping };
   } catch (e) {
-    console.error('annotateHtmlForClassOffsets error', e);
-    // Fallback: no annotation
-    return { annotatedHtml: sourceHtml, mapping: new Map() };
+    try { console.error('annotateHtmlForClassOffsets error (parse5 path)', e && e.message ? e.message : e); } catch {}
+    // Fallback: keep previous heuristic approach
+    try {
+      const mapping = new Map();
+      let out = '';
+      let last = 0;
+      let uidCounter = 1;
+      const tagRe = /<([a-zA-Z][\w:-]*)([^>]*)>/g;
+      let m;
+      while ((m = tagRe.exec(sourceHtml)) !== null) {
+        const full = m[0];
+        const tagName = m[1];
+        const attrs = m[2] || '';
+        const classRe = /\bclass\s*=\s*(["'])([\s\S]*?)\1/i;
+        const cm = classRe.exec(attrs);
+        if (!cm) continue;
+        const quote = cm[1];
+        const classValue = cm[2];
+        const attrsStartInFull = 1 + tagName.length;
+        const openQuoteInAttrs = cm.index + cm[0].indexOf(quote);
+        const valueStartInAttrs = openQuoteInAttrs + 1;
+        const valueEndInAttrs = valueStartInAttrs + classValue.length;
+        const tagStartInDoc = m.index;
+        const valueStartInDoc = tagStartInDoc + attrsStartInFull + valueStartInAttrs;
+        const valueEndInDoc = tagStartInDoc + attrsStartInFull + valueEndInAttrs;
+        const closeIsSelf = /\/>\s*$/.test(full);
+        const injection = ` data-twv-uid="${uidCounter}"`;
+        const insertPosInFull = full.length - (closeIsSelf ? 2 : 1);
+        const newStartTag = full.slice(0, insertPosInFull) + injection + full.slice(insertPosInFull);
+        out += sourceHtml.slice(last, tagStartInDoc) + newStartTag;
+        last = tagStartInDoc + full.length;
+        mapping.set(String(uidCounter), { start: valueStartInDoc, end: valueEndInDoc, original: classValue });
+        uidCounter++;
+      }
+      out += sourceHtml.slice(last);
+      return { annotatedHtml: out, mapping };
+    } catch (e2) {
+      try { console.error('annotateHtmlForClassOffsets error (fallback path)', e2 && e2.message ? e2.message : e2); } catch {}
+      return { annotatedHtml: sourceHtml, mapping: new Map() };
+    }
+  }
+}
+
+// Compute the start/end offsets of an attribute's VALUE within the document given the attribute span
+// Handles quoted (single/double) and unquoted values.
+function computeAttrValueOffsetsFromSpan(source, attrStart, attrEnd) {
+  try {
+    const seg = source.slice(attrStart, attrEnd);
+    const eqIdx = seg.indexOf('=');
+    if (eqIdx === -1) return null; // boolean/no-value attribute (unexpected for class)
+    // Skip whitespace after '='
+    let i = eqIdx + 1;
+    while (i < seg.length && /\s/.test(seg[i])) i++;
+    if (i >= seg.length) return null;
+    let valueStartInSeg = i;
+    let valueEndInSeg = seg.length;
+    const ch = seg[i];
+    if (ch === '"' || ch === "'") {
+      const q = ch;
+      valueStartInSeg = i + 1;
+      const close = seg.indexOf(q, valueStartInSeg);
+      const endIdx = (close === -1) ? seg.length : close; // fall back to end if malformed
+      valueEndInSeg = endIdx;
+    } else {
+      // Unquoted: read until whitespace
+      let j = i;
+      while (j < seg.length && !/\s/.test(seg[j])) j++;
+      valueStartInSeg = i;
+      valueEndInSeg = j;
+    }
+    const valueStart = attrStart + valueStartInSeg;
+    const valueEnd = attrStart + valueEndInSeg;
+    if (valueStart >= valueEnd) return null;
+    return { valueStart, valueEnd };
+  } catch {
+    return null;
   }
 }
 
@@ -913,7 +996,7 @@ function buildServerPreviewHtml(webview, iframeUrl, clientScriptUrl) {
           if (!iframe || ev.source !== iframe.contentWindow) return;
           const data = ev.data || {};
           if (data && data.source === 'twv-client' && data.type) {
-            if (vscode) vscode.postMessage({ type: 'serverUpdateDynamicTemplate', before: data.before || '', after: data.after || '' });
+            if (vscode) vscode.postMessage({ type: 'serverUpdateDynamicTemplate', before: data.before || '', after: data.after || '', text: data.text || '', tag: data.tag || '', id: data.id || '' });
           }
         } catch (e) { console.error('message relay error', e); }
       });
@@ -972,82 +1055,256 @@ async function persistDynamicClassEditWorkspace(before, after) {
 // - Scan workspace for occurrences of the class string in string literals
 // - If exactly one file contains matches, update and save it automatically
 // - If multiple files contain matches, prompt the user to pick which files to update
-async function persistDynamicClassEditSmart(before, after) {
+async function persistDynamicClassEditSmart(before, after, hint) {
   try {
     const vscode = require('vscode');
-    const path = require('path');
-    const folders = vscode.workspace.workspaceFolders || [];
-    const toRel = (uri) => {
-      if (!folders.length) return uri.fsPath || uri.path || uri.toString();
-      for (const f of folders) {
-        if (uri.fsPath && uri.fsPath.startsWith(f.uri.fsPath + path.sep)) {
-          return path.relative(f.uri.fsPath, uri.fsPath);
-        }
-      }
-      return uri.fsPath || uri.path || uri.toString();
-    };
+    const files = await vscode.workspace.findFiles('**/*.{html,js,jsx,ts,tsx,vue,svelte,astro}', '**/{node_modules,dist,build,.next,.nuxt,out,coverage,.git}/**', 5000);
 
+    // Helpers
     const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const normWs = (s) => s.replace(/\s+/g, ' ').trim();
+    const canonTokens = (s) => normWs(s).split(/\s+/).filter(Boolean).sort();
+    const eqTokens = (a, b) => {
+      if (a.length !== b.length) return false; for (let i=0;i<a.length;i++) if (a[i] !== b[i]) return false; return true;
+    };
+    const beforeTokens = canonTokens(before);
+
+    let changedFiles = 0;
+
+    // First pass: simple exact literal replacement for speed
     const dqRe = new RegExp('"' + escapeRe(before) + '"', 'g');
     const sqRe = new RegExp("'" + escapeRe(before) + "'", 'g');
     const btRe = new RegExp('`' + escapeRe(before) + '`', 'g');
-    const files = await vscode.workspace.findFiles('**/*.{html,js,jsx,ts,tsx,vue,svelte,astro}', '**/{node_modules,dist,build,.next,.nuxt,out,coverage,.git}/**', 5000);
-    const matches = [];
+
+    const exactMatches = [];
     for (const uri of files) {
       try {
         const buf = await vscode.workspace.fs.readFile(uri);
         const text = Buffer.from(buf).toString('utf8');
-        const count = (text.match(dqRe)?.length || 0) + (text.match(sqRe)?.length || 0) + (text.match(btRe)?.length || 0);
-        if (count > 0) {
-          matches.push({ uri, text, count });
+        if (dqRe.test(text) || sqRe.test(text) || btRe.test(text)) {
+          exactMatches.push({ uri, text });
         }
       } catch {}
     }
 
-    if (matches.length === 0) {
-      vscode.window.showInformationMessage('No matching class string found to persist.');
-      return 0;
-    }
-
-    if (matches.length === 1) {
-      const m = matches[0];
-      const doc = await vscode.workspace.openTextDocument(m.uri);
-      const replaced = doc.getText().replace(dqRe, '"' + after + '"').replace(sqRe, "'" + after + "'").replace(btRe, '`' + after + '`');
-      if (replaced !== doc.getText()) {
-        const edit = new vscode.WorkspaceEdit();
-        const full = new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length));
-        edit.replace(m.uri, full, replaced);
-        const ok = await vscode.workspace.applyEdit(edit);
-        if (ok) { try { await doc.save(); } catch {} }
-        return ok ? 1 : 0;
+    if (exactMatches.length > 0) {
+      for (const m of exactMatches) {
+        try {
+          const doc = await vscode.workspace.openTextDocument(m.uri);
+          const text = doc.getText();
+          const replaced = text.replace(dqRe, '"' + after + '"').replace(sqRe, "'" + after + "'").replace(btRe, '`' + after + '`');
+          if (replaced !== text) {
+            const edit = new vscode.WorkspaceEdit();
+            const full = new vscode.Range(doc.positionAt(0), doc.positionAt(text.length));
+            edit.replace(m.uri, full, replaced);
+            const ok = await vscode.workspace.applyEdit(edit);
+            if (ok) { try { await doc.save(); } catch {} changedFiles++; }
+          }
+        } catch {}
       }
-      return 0;
     }
 
-    // Multiple files: let the user choose
-    const picks = await vscode.window.showQuickPick(
-      matches.map((m) => ({ label: toRel(m.uri), description: `${m.count} match(es)`, m })),
-      { canPickMany: true, placeHolder: 'Multiple files contain this class string. Select files to update, or Esc to cancel.' }
-    );
-    if (!picks || picks.length === 0) return -1; // cancelled
-
-    let changed = 0;
-    for (const p of picks) {
-      const m = p.m;
+    // Second pass: tolerant matching (order/whitespace agnostic) for HTML-like files
+    for (const uri of files) {
+      const ext = (uri.path || uri.fsPath || '').toLowerCase();
+      if (!/(\.html$|\.vue$|\.svelte$|\.astro$)/.test(ext)) continue;
       try {
-        const doc = await vscode.workspace.openTextDocument(m.uri);
-        const text = doc.getText();
-        const replaced = text.replace(dqRe, '"' + after + '"').replace(sqRe, "'" + after + "'").replace(btRe, '`' + after + '`');
-        if (replaced !== text) {
-          const edit = new vscode.WorkspaceEdit();
-          const full = new vscode.Range(doc.positionAt(0), doc.positionAt(text.length));
-          edit.replace(m.uri, full, replaced);
-          const ok = await vscode.workspace.applyEdit(edit);
-          if (ok) { try { await doc.save(); } catch {} changed++; }
+        if (!parse5) { try { parse5 = require('parse5'); } catch { parse5 = null; } }
+        if (!parse5) break;
+        const buf = await vscode.workspace.fs.readFile(uri);
+        const text = Buffer.from(buf).toString('utf8');
+        const doc = parse5.parse(text, { sourceCodeLocationInfo: true });
+        const repls = [];
+        const visit = (n) => {
+          if (!n) return; if (Array.isArray(n.childNodes)) n.childNodes.forEach(visit);
+          if (!Array.isArray(n.attrs) || !n.sourceCodeLocation) return;
+          const cls = n.attrs.find(a => a.name === 'class');
+          const locs = n.sourceCodeLocation.attrs || {};
+          const loc = locs['class'];
+          if (!cls || !loc) return;
+          const v = cls.value || '';
+          const valTokens = canonTokens(v);
+          if (!valTokens.length) return;
+          if (eqTokens(valTokens, beforeTokens)) {
+            // Compute value offsets within the attribute span
+            const off = computeAttrValueOffsetsFromSpan(text, loc.startOffset, loc.endOffset);
+            if (off && off.valueStart < off.valueEnd) {
+              repls.push(off);
+            }
+          }
+        };
+        visit(doc);
+        if (repls.length > 0) {
+          // Build replaced text via slices
+          repls.sort((a,b) => a.valueStart - b.valueStart);
+          let last = 0; let out = '';
+          for (const r of repls) { out += text.slice(last, r.valueStart) + after; last = r.valueEnd; }
+          out += text.slice(last);
+          if (out !== text) {
+            const d = await vscode.workspace.openTextDocument(uri);
+            const edit = new vscode.WorkspaceEdit();
+            const full = new vscode.Range(d.positionAt(0), d.positionAt(text.length));
+            edit.replace(uri, full, out);
+            const ok = await vscode.workspace.applyEdit(edit);
+            if (ok) { try { await d.save(); } catch {} changedFiles++; }
+          }
         }
       } catch {}
     }
-    return changed;
+
+    // Third pass: tolerant string-literal matching across JS-like files
+    const strRe = /(["'`])(?:\\.|(?!\1)[\s\S])*\1/g; // naive string literal matcher (handles escapes roughly)
+    for (const uri of files) {
+      const ext = (uri.path || uri.fsPath || '').toLowerCase();
+      if (!/(\.js$|\.jsx$|\.ts$|\.tsx$|\.vue$|\.svelte$|\.astro$|\.html$)/.test(ext)) continue;
+      try {
+        const buf = await vscode.workspace.fs.readFile(uri);
+        const text = Buffer.from(buf).toString('utf8');
+        let m; let out = ''; let last = 0; let did = false;
+        while ((m = strRe.exec(text)) !== null) {
+          const full = m[0]; const q = full[0];
+          const inner = full.slice(1, -1);
+          const tokens = canonTokens(inner);
+          if (tokens.length && eqTokens(tokens, beforeTokens)) {
+            out += text.slice(last, m.index) + q + after + q;
+            last = m.index + full.length;
+            did = true;
+          }
+        }
+        if (did) {
+          out += text.slice(last);
+          if (out !== text) {
+            const d = await vscode.workspace.openTextDocument(uri);
+            const edit = new vscode.WorkspaceEdit();
+            const fullRange = new vscode.Range(d.positionAt(0), d.positionAt(text.length));
+            edit.replace(uri, fullRange, out);
+            const ok = await vscode.workspace.applyEdit(edit);
+            if (ok) { try { await d.save(); } catch {} changedFiles++; }
+          }
+        }
+      } catch {}
+    }
+
+    if (changedFiles > 0) return changedFiles;
+
+    // Fourth pass: try updating a base constant string by removing only the removed tokens
+    const afterTokens = canonTokens(after);
+    const removedTokens = beforeTokens.filter(t => !afterTokens.includes(t));
+    const addedTokens = afterTokens.filter(t => !beforeTokens.includes(t));
+    if (removedTokens.length > 0 && addedTokens.length === 0) {
+      const assignRe = /(?:^|[^\w$])(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(["'`])((?:\\.|(?!\3)[\s\S])*)\3/gm;
+      const candidates = [];
+      for (const uri of files) {
+        const ext = (uri.path || uri.fsPath || '').toLowerCase();
+        if (!/(\.js$|\.jsx$|\.ts$|\.tsx$|\.vue$|\.svelte$|\.astro$)/.test(ext)) continue;
+        try {
+          const buf = await vscode.workspace.fs.readFile(uri);
+          const text = Buffer.from(buf).toString('utf8');
+          let m; assignRe.lastIndex = 0;
+          while ((m = assignRe.exec(text)) !== null) {
+            const q = m[3];
+            const inner = m[4];
+            const toks = canonTokens(inner);
+            if (!toks.length) continue;
+            // The constant must be a subset of before tokens and contain all removed tokens
+            const isSubset = toks.every(t => beforeTokens.includes(t));
+            const hasAllRemoved = removedTokens.every(rt => toks.includes(rt));
+            if (isSubset && hasAllRemoved) {
+              candidates.push({ uri, index: m.index, length: m[0].length, quote: q, inner, toks, full: m[0] });
+            }
+          }
+        } catch {}
+      }
+      if (candidates.length === 1) {
+        const c = candidates[0];
+        try {
+          const doc = await vscode.workspace.openTextDocument(c.uri);
+          const text = doc.getText();
+          // Re-run regex to compute exact slice positions within current doc text
+          assignRe.lastIndex = 0;
+          let pos = -1; let match;
+          while ((match = assignRe.exec(text)) !== null) {
+            if (match[0] === c.full) { pos = match.index; break; }
+          }
+          if (pos >= 0) {
+            const startInner = pos + match[0].indexOf(match[3]) + 1; // after opening quote
+            const endInner = startInner + match[4].length;
+            const newInner = c.toks.filter(t => !removedTokens.includes(t)).join(' ');
+            const edit = new vscode.WorkspaceEdit();
+            edit.replace(c.uri, new vscode.Range(doc.positionAt(startInner), doc.positionAt(endInner)), newInner);
+            const ok = await vscode.workspace.applyEdit(edit);
+            if (ok) { try { await doc.save(); } catch {} changedFiles += 1; }
+          }
+        } catch {}
+      }
+    }
+
+    if (changedFiles > 0) return changedFiles;
+
+    // Fifth pass: hint-assisted proximity replacement (uses element text content to narrow file and region)
+    try {
+      const t = hint && typeof hint.text === 'string' ? hint.text.trim() : '';
+      if (t && t.length >= 4) {
+        const textEsc = escapeRe(t);
+        const dqText = new RegExp('"' + textEsc + '"', 'g');
+        const sqText = new RegExp("'" + textEsc + "'", 'g');
+        const btText = new RegExp('`' + textEsc + '`', 'g');
+        const strRe = /(["'`])(?:\\.|(?!\1)[\s\S])*\1/g;
+        const proximity = 3000; // chars to scan around the hint text
+        const nearClassCtx = /(className|setAttribute\(\s*['\"]class['\"])\s*[:=]/;
+        for (const uri of files) {
+          const ext = (uri.path || uri.fsPath || '').toLowerCase();
+          if (!/(\.js$|\.jsx$|\.ts$|\.tsx$|\.vue$|\.svelte$|\.astro$|\.html$)/.test(ext)) continue;
+          try {
+            const buf = await vscode.workspace.fs.readFile(uri);
+            const text = Buffer.from(buf).toString('utf8');
+            let idx = -1;
+            let m1 = dqText.exec(text); if (m1) idx = m1.index;
+            if (idx < 0) { let m2 = sqText.exec(text); if (m2) idx = m2.index; }
+            if (idx < 0) { let m3 = btText.exec(text); if (m3) idx = m3.index; }
+            if (idx < 0) continue;
+            const start = Math.max(0, idx - proximity);
+            const end = Math.min(text.length, idx + t.length + proximity);
+            const win = text.slice(start, end);
+            let best = null; let bestScore = Infinity;
+            let sm;
+            strRe.lastIndex = 0;
+            while ((sm = strRe.exec(win)) !== null) {
+              const full = sm[0]; const q = full[0];
+              const inner = full.slice(1, -1);
+              const tokens = canonTokens(inner);
+              if (!tokens.length) continue;
+              const isSuperset = beforeTokens.every(bt => tokens.includes(bt));
+              if (!isSuperset) continue;
+              // Prefer literals near class context
+              const litPos = start + sm.index;
+              const ctxStart = Math.max(0, litPos - 160);
+              const ctxEnd = Math.min(text.length, litPos + full.length + 160);
+              const ctx = text.slice(ctxStart, ctxEnd);
+              const nearClass = nearClassCtx.test(ctx) ? 0 : 1;
+              // Distance to hint
+              const dist = Math.abs((start + sm.index) - idx);
+              const score = nearClass * 100000 + dist;
+              if (!best || score < bestScore) {
+                best = { litPos, full, q, inner, score };
+                bestScore = score;
+              }
+            }
+            if (best) {
+              const doc = await vscode.workspace.openTextDocument(uri);
+              const replaceWith = best.q + after + best.q;
+              const edit = new vscode.WorkspaceEdit();
+              edit.replace(uri, new vscode.Range(doc.positionAt(best.litPos), doc.positionAt(best.litPos + best.full.length)), replaceWith);
+              const ok = await vscode.workspace.applyEdit(edit);
+              if (ok) { try { await doc.save(); } catch {} changedFiles += 1; }
+              if (changedFiles > 0) return changedFiles;
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+
+    return changedFiles;
   } catch (e) {
     console.error('persistDynamicClassEditSmart error', e);
     return 0;
@@ -1116,7 +1373,7 @@ function getRemoteClientScript() {
         "function autosize(){ input.style.height = 'auto'; input.style.height = Math.min(280, input.scrollHeight + 2) + 'px'; r = editor.getBoundingClientRect(); let ny = r.top; if (r.bottom > vh - 8) ny = Math.max(8, vh - 8 - r.height); editor.style.top = ny + 'px'; }"+
         "autosize(); input.addEventListener('input', autosize); window.addEventListener('resize', autosize, { passive: true });"+
         "function close(){ editor.style.display = 'none'; input.removeEventListener('input', autosize); d.removeEventListener('keydown', onKey, true); }"+
-        "async function commit(){ const before = cur; const after = (input.value || '').trim(); el.setAttribute('class', after); try { window.parent && window.parent.postMessage({ source:'twv-client', type:'update', before: before, after: after }, '*'); } catch(e){} close(); }"+
+        "async function commit(){ const before = cur; const after = (input.value || '').trim(); el.setAttribute('class', after); try { var txt=''; try{ txt=(el.textContent||'').trim().slice(0,160);}catch(_){txt='';} window.parent && window.parent.postMessage({ source:'twv-client', type:'update', before: before, after: after, text: txt, tag: (el.tagName||'').toLowerCase(), id: el.id||'' }, '*'); } catch(e){} close(); }"+
         "function onKey(ev){ if (ev.key === 'Escape') { ev.preventDefault(); close(); } if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey || !ev.shiftKey)) { ev.preventDefault(); commit(); } }"+
         "d.addEventListener('keydown', onKey, { capture:true }); btnCancel.onclick = (ev) => { ev.preventDefault(); close(); }; btnSave.onclick = (ev) => { ev.preventDefault(); commit(); };"+
       "}"+

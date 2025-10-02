@@ -28,7 +28,7 @@ Commands:
 **Development Notes**
 - Preview pipeline: The extension injects a helper script and styles into the webview. It inserts a `<base>` tag and a permissive CSP to allow Tailwind CDN and local assets. Absolute-root URLs (`/assets/...`) are rewritten to the first workspace folder.
 - Tailwind detection: Command/menu enabled via `tailwindPreview.hasTailwind` context key; checks for CDN, filenames containing "tailwind", or common utility classes.
-- Class-to-source mapping: At preview build, start tags with a `class` attribute get `data-twv-uid` and we record byte offsets for the class value. Edits only persist if you double‑click the exact mapped element. If the source diverges after opening the preview, we warn and skip; reopen the preview to re-sync.
+- Class-to-source mapping: Uses a robust HTML parser (parse5) with location info to map `class` attribute value byte offsets precisely, even with complex attributes. Start tags with a `class` attribute get `data-twv-uid` in the preview. Edits persist only when you double‑click the mapped element. Offsets are adjusted in-memory after each edit so subsequent edits remain accurate; saving also refreshes the mapping.
 - Pause/Resume: Toggle in the preview’s top‑right (and `p` key) freezes interactions. We:
   - Show a non-interactive shield and pause CSS animations/transitions; pause playing audio/video.
   - Swallow most pointer events in capture phase but allow our UI controls/editor; keyboard events are not suppressed so `p` works.
