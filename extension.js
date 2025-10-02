@@ -8,6 +8,9 @@ let parse5 = null; // lazy-loaded for preview mapping
  */
 function activate(context) {
   const HAS_TW_KEY = 'tailwindPreview.hasTailwind';
+  // Track the most recently modified document so server preview undo/redo can target it
+  /** @type {vscode.Uri | null} */
+  let lastTouchedDocUri = null;
 
   // Lazy HTTP server for serving the remote preview client helper script
   let clientServer = null;
@@ -122,10 +125,23 @@ function activate(context) {
     });
     panel.onDidDispose(() => saveSub.dispose());
 
-    // Handle class updates from the preview
-  panel.webview.onDidReceiveMessage(async (msg) => {
+    // Handle class updates and undo/redo from the preview
+    panel.webview.onDidReceiveMessage(async (msg) => {
       try {
         if (!msg || !msg.type) return;
+        if (msg.type === 'undo' || msg.type === 'redo') {
+          try {
+            // Bring the source document to the foreground, run undo/redo, save, then re-focus preview
+            await vscode.window.showTextDocument(doc, { preserveFocus: false, preview: false });
+            await vscode.commands.executeCommand(msg.type === 'undo' ? 'undo' : 'redo');
+            try { await doc.save(); } catch {}
+            try { panel.reveal(); } catch {}
+          } catch (e) {
+            console.error('Undo/redo failed', e);
+            vscode.window.showErrorMessage('Undo/redo failed.');
+          }
+          return;
+        }
         if (msg.type === 'updateClasses') {
           const { uid, newValue } = msg;
           if (!uid || typeof newValue !== 'string') return;
@@ -154,7 +170,7 @@ function activate(context) {
             return;
           }
           // Auto-save the edited document
-          try { await doc.save(); } catch {}
+          try { await doc.save(); lastTouchedDocUri = doc.uri; } catch {}
           // Update our mapping in-memory to reflect the new lengths so follow-up edits work pre-save
           try {
             const oldLen = (info.end - info.start);
@@ -256,6 +272,7 @@ function activate(context) {
                   const uri = vscode.Uri.parse(uriStr);
                   const docToSave = await vscode.workspace.openTextDocument(uri);
                   await docToSave.save();
+                  lastTouchedDocUri = uri;
                 } catch {}
               }
             }
@@ -301,6 +318,25 @@ function activate(context) {
       panel.webview.onDidReceiveMessage(async (msg) => {
         try {
           if (!msg || !msg.type) return;
+          if (msg.type === 'serverUndo' || msg.type === 'serverRedo') {
+            try {
+              // Prefer undo/redo on the last touched document
+              try {
+                const uri = (typeof lastTouchedDocUri !== 'undefined' && lastTouchedDocUri) ? lastTouchedDocUri : (vscode.window.activeTextEditor && vscode.window.activeTextEditor.document && vscode.window.activeTextEditor.document.uri);
+                if (uri) {
+                  const d = await vscode.workspace.openTextDocument(uri);
+                  await vscode.window.showTextDocument(d, { preserveFocus: false, preview: false });
+                }
+              } catch {}
+              await vscode.commands.executeCommand(msg.type === 'serverUndo' ? 'undo' : 'redo');
+              // Save the active file to encourage dev servers to reload
+              try { await vscode.commands.executeCommand('workbench.action.files.save'); } catch {}
+            } catch (e) {
+              console.error('server undo/redo error', e);
+              vscode.window.showErrorMessage('Server preview undo/redo failed.');
+            }
+            return;
+          }
           if (msg.type === 'copyToClipboard' && typeof msg.text === 'string') {
             try {
               await vscode.env.clipboard.writeText(msg.text);
@@ -314,8 +350,10 @@ function activate(context) {
             const before = (msg && typeof msg.before === 'string') ? msg.before : '';
             const after = (msg && typeof msg.after === 'string') ? msg.after : '';
             if (!before || !after || before === after) return;
-            const changedCount = await persistDynamicClassEditSmart(before, after, { text: (msg && typeof msg.text === 'string') ? msg.text : '', tag: (msg && typeof msg.tag === 'string') ? msg.tag : '', id: (msg && typeof msg.id === 'string') ? msg.id : '' });
+            const result = await persistDynamicClassEditSmart(before, after, { text: (msg && typeof msg.text === 'string') ? msg.text : '', tag: (msg && typeof msg.tag === 'string') ? msg.tag : '', id: (msg && typeof msg.id === 'string') ? msg.id : '' });
+            const changedCount = (result && typeof result.changed === 'number') ? result.changed : (typeof result === 'number' ? result : 0);
             if (changedCount > 0) {
+              try { if (result && result.lastUri) { lastTouchedDocUri = vscode.Uri.parse(result.lastUri); } } catch {}
               vscode.window.showInformationMessage(`Updated and saved ${changedCount} file(s) with new Tailwind classes.`);
             } else if (changedCount === 0) {
               vscode.window.showInformationMessage('No matching class string found to persist. The classes may be composed dynamically; try editing the template/HTML or ensure the exact class string exists in a string literal.');
@@ -753,6 +791,16 @@ function getHelperScript() {
             // Enter without Shift commits; Shift+Enter inserts newline
             if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey || !ev.shiftKey)) { ev.preventDefault(); commit(); }
           }
+          // Ensure Cmd/Ctrl+Z acts on the textarea when focused
+          input.addEventListener('keydown', (ev) => {
+            try {
+              const k = String(ev.key || '').toLowerCase();
+              const meta = !!(ev.metaKey || ev.ctrlKey);
+              if (!meta || k !== 'z') return;
+              ev.preventDefault(); ev.stopPropagation();
+              try { document.execCommand(ev.shiftKey ? 'redo' : 'undo'); } catch(_) {}
+            } catch(_) {}
+          }, { capture: true });
           d.addEventListener('keydown', onKey, { capture: true });
           btnCancel.onclick = (ev) => { ev.preventDefault(); close(); };
           btnSave.onclick = (ev) => { ev.preventDefault(); commit(); };
@@ -794,6 +842,21 @@ function getHelperScript() {
         'touchstart','touchend','dragstart','dragover','drop',
         'mouseover','mouseout','mouseenter','mouseleave'
       ].forEach(t => { d.addEventListener(t, swallow, { capture: true }); });
+
+      // Global undo/redo when not editing in our textarea
+      d.addEventListener('keydown', (ev) => {
+        try {
+          const k = String(ev.key || '').toLowerCase();
+          const meta = !!(ev.metaKey || ev.ctrlKey);
+          const inOurEditor = !!(d.activeElement && (d.activeElement.closest && d.activeElement.closest('#twv-editor')));
+          if (!meta || (k !== 'z')) return;
+          if (inOurEditor) return; // let the textarea handle its own undo stack
+          ev.preventDefault(); ev.stopPropagation();
+          if (vscodeApi) {
+            vscodeApi.postMessage({ type: ev.shiftKey ? 'redo' : 'undo' });
+          }
+        } catch(_) {}
+      }, { capture: true });
     } catch (e) { console.error('twv helper error', e); }
   })();
 </script>
@@ -987,7 +1050,17 @@ function buildServerPreviewHtml(webview, iframeUrl, clientScriptUrl) {
       function updatePauseButton(){ pauseBtn.textContent = paused ? 'Resume' : 'Pause'; pauseBtn.classList.toggle('active', paused); }
       function sendPause(){ try { iframe && iframe.contentWindow && iframe.contentWindow.postMessage({ source:'twv-host', type:'setPaused', value: paused }, '*'); } catch(_){} }
       pauseBtn.onclick = () => { paused = !paused; updatePauseButton(); sendPause(); };
-      window.addEventListener('keydown', (e) => { if ((e.key==='p'||e.key==='P') && !(e.metaKey||e.ctrlKey||e.altKey||e.shiftKey)) { e.preventDefault(); paused = !paused; updatePauseButton(); sendPause(); } });
+      window.addEventListener('keydown', (e) => {
+        // Toggle pause with 'p'
+        if ((e.key==='p'||e.key==='P') && !(e.metaKey||e.ctrlKey||e.altKey||e.shiftKey)) { e.preventDefault(); paused = !paused; updatePauseButton(); sendPause(); return; }
+        // Undo/redo when focus is inside the host page
+        const k = String(e.key||'').toLowerCase();
+        const meta = !!(e.metaKey||e.ctrlKey);
+        if (meta && k === 'z') {
+          e.preventDefault();
+          if (vscode) vscode.postMessage({ type: e.shiftKey ? 'serverRedo' : 'serverUndo' });
+        }
+      });
       updatePauseButton();
 
       // Relay messages from iframe client to the extension
@@ -996,7 +1069,12 @@ function buildServerPreviewHtml(webview, iframeUrl, clientScriptUrl) {
           if (!iframe || ev.source !== iframe.contentWindow) return;
           const data = ev.data || {};
           if (data && data.source === 'twv-client' && data.type) {
-            if (vscode) vscode.postMessage({ type: 'serverUpdateDynamicTemplate', before: data.before || '', after: data.after || '', text: data.text || '', tag: data.tag || '', id: data.id || '' });
+            if (!vscode) return;
+            if (data.type === 'undo' || data.type === 'redo') {
+              vscode.postMessage({ type: data.type === 'undo' ? 'serverUndo' : 'serverRedo' });
+            } else {
+              vscode.postMessage({ type: 'serverUpdateDynamicTemplate', before: data.before || '', after: data.after || '', text: data.text || '', tag: data.tag || '', id: data.id || '' });
+            }
           }
         } catch (e) { console.error('message relay error', e); }
       });
@@ -1071,6 +1149,7 @@ async function persistDynamicClassEditSmart(before, after, hint) {
     const beforeTokens = canonTokens(before);
 
     let changedFiles = 0;
+    let lastUriStr = '';
 
     // First pass: simple exact literal replacement for speed (scoped)
     const dqRe = new RegExp('"' + escapeRe(before) + '"', 'g');
@@ -1146,7 +1225,7 @@ async function persistDynamicClassEditSmart(before, after, hint) {
             const full = new vscode.Range(doc.positionAt(0), doc.positionAt(text.length));
             edit.replace(m.uri, full, replaced);
             const ok = await vscode.workspace.applyEdit(edit);
-            if (ok) { try { await doc.save(); } catch {} changedFiles++; }
+            if (ok) { try { await doc.save(); lastUriStr = m.uri.toString(); } catch {} changedFiles++; }
           }
         } catch {}
       }
@@ -1154,7 +1233,7 @@ async function persistDynamicClassEditSmart(before, after, hint) {
 
     // If we intentionally targeted a single file in exact pass, stop here to avoid touching other files
     if (singleTargetMode && changedFiles > 0) {
-      return changedFiles;
+      return { changed: changedFiles, lastUri: lastUriStr };
     }
 
     // Second pass: tolerant matching (order/whitespace agnostic) for HTML-like files (single-file intent)
@@ -1199,7 +1278,7 @@ async function persistDynamicClassEditSmart(before, after, hint) {
             const full = new vscode.Range(d.positionAt(0), d.positionAt(text.length));
             edit.replace(uri, full, out);
             const ok = await vscode.workspace.applyEdit(edit);
-            if (ok) { try { await d.save(); } catch {} changedFiles++; }
+            if (ok) { try { await d.save(); lastUriStr = uri.toString(); } catch {} changedFiles++; }
           }
         }
       } catch {}
@@ -1232,13 +1311,13 @@ async function persistDynamicClassEditSmart(before, after, hint) {
             const fullRange = new vscode.Range(d.positionAt(0), d.positionAt(text.length));
             edit.replace(uri, fullRange, out);
             const ok = await vscode.workspace.applyEdit(edit);
-            if (ok) { try { await d.save(); } catch {} changedFiles++; }
+            if (ok) { try { await d.save(); lastUriStr = uri.toString(); } catch {} changedFiles++; }
           }
         }
       } catch {}
     }
 
-    if (changedFiles > 0) return changedFiles;
+    if (changedFiles > 0) return { changed: changedFiles, lastUri: lastUriStr };
 
     // Fourth pass: try updating a base constant string by removing only the removed tokens
     const afterTokens = canonTokens(after);
@@ -1286,13 +1365,13 @@ async function persistDynamicClassEditSmart(before, after, hint) {
             const edit = new vscode.WorkspaceEdit();
             edit.replace(c.uri, new vscode.Range(doc.positionAt(startInner), doc.positionAt(endInner)), newInner);
             const ok = await vscode.workspace.applyEdit(edit);
-            if (ok) { try { await doc.save(); } catch {} changedFiles += 1; }
+            if (ok) { try { await doc.save(); lastUriStr = c.uri.toString(); } catch {} changedFiles += 1; }
           }
         } catch {}
       }
     }
 
-    if (changedFiles > 0) return changedFiles;
+    if (changedFiles > 0) return { changed: changedFiles, lastUri: lastUriStr };
 
     // Fifth pass: hint-assisted proximity replacement (uses element text content to narrow file and region)
     try {
@@ -1349,18 +1428,18 @@ async function persistDynamicClassEditSmart(before, after, hint) {
               const edit = new vscode.WorkspaceEdit();
               edit.replace(uri, new vscode.Range(doc.positionAt(best.litPos), doc.positionAt(best.litPos + best.full.length)), replaceWith);
               const ok = await vscode.workspace.applyEdit(edit);
-              if (ok) { try { await doc.save(); } catch {} changedFiles += 1; }
-              if (changedFiles > 0) return changedFiles;
+              if (ok) { try { await doc.save(); lastUriStr = uri.toString(); } catch {} changedFiles += 1; }
+              if (changedFiles > 0) return { changed: changedFiles, lastUri: lastUriStr };
             }
           } catch {}
         }
       }
     } catch {}
 
-    return changedFiles;
+    return { changed: changedFiles, lastUri: lastUriStr };
   } catch (e) {
     console.error('persistDynamicClassEditSmart error', e);
-    return 0;
+    return { changed: 0, lastUri: '' };
   }
 }
 
@@ -1433,6 +1512,8 @@ function getRemoteClientScript() {
       "d.addEventListener('dblclick', (e) => { const t = e.target; if (t && t.closest && t.closest('#twv-editor')) return; if (!(t instanceof Element)) return; e.preventDefault(); e.stopPropagation(); openEditorFor(t, e.clientX, e.clientY); }, { capture: true });"+
       "const swallow = (ev) => { if (!paused) return; const path = ev.composedPath ? ev.composedPath() : []; const t = ev.target; const inEditor = (n) => !!n && (n.id === 'twv-editor' || (n.closest && n.closest('#twv-editor'))); if (inEditor(t) || (Array.isArray(path) && path.some(inEditor))) return; ev.stopImmediatePropagation(); ev.preventDefault(); };"+
       "['click','dblclick','mousedown','mouseup','pointerdown','pointerup','pointermove','mousemove','contextmenu','touchstart','touchend','dragstart','dragover','drop','mouseover','mouseout','mouseenter','mouseleave'].forEach(t => { d.addEventListener(t, swallow, { capture: true }); });"+
+      // Global undo/redo when not editing inside our textarea
+      "d.addEventListener('keydown', (ev) => { try { const k = String(ev.key||'').toLowerCase(); const meta = !!(ev.metaKey||ev.ctrlKey); if (!meta || k !== 'z') return; if (d.activeElement && d.activeElement.closest && d.activeElement.closest('#twv-editor')) return; ev.preventDefault(); ev.stopPropagation(); window.parent && window.parent.postMessage({ source:'twv-client', type: (ev.shiftKey ? 'redo' : 'undo') }, '*'); } catch(_){} }, { capture: true });"+
     "} catch (e) { console.error('twv remote client error', e); }"+
   "})();";
 }
