@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Tailwind Class Editor Test</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 p-8">
+    <div class="max-w-4xl mx-auto space-y-6">
+        <h1 class="text-3xl font-bold text-gray-900">LLM Tailwind Class Editor Test</h1>
+        
+        <div class="bg-white p-6 rounded-lg shadow-md">
+            <h2 class="text-xl font-semibold mb-2">How to use:</h2>
+            <ol class="list-decimal list-inside space-y-2 text-gray-700">
+                <li>Open this file in VS Code</li>
+                <li>Click the "Tailwind: Open Preview" button in the top toolbar</li>
+                <li>Double-click on any element in the preview</li>
+                <li>In the popup editor, type your classes followed by " -- " and a prompt</li>
+                <li>Example: <code class="bg-gray-200 px-2 py-1 rounded">p-4 bg-blue-500 -- make the padding larger</code></li>
+                <li>Press Enter or click "Send to LLM" to edit the classes</li>
+                <li>Watch the console (F12) for debugging logs</li>
+            </ol>
+        </div>
+
+        <div class="bg-blue-500 text-white p-4 rounded-lg">
+            <h3 class="text-lg font-bold">Test Element 1</h3>
+            <p>Double-click me and try: "p-4 bg-blue-500 text-white rounded-lg -- make it red"</p>
+        </div>
+
+        <div class="bg-green-600 text-white p-6 rounded shadow-lg">
+            <h3 class="text-2xl font-bold mb-2">Test Element 2</h3>
+            <p class="text-sm">Try: "bg-green-600 text-white p-6 rounded shadow-lg -- increase the shadow and padding"</p>
+        </div>
+
+        <div class="flex gap-4 items-center justify-center bg-purple-500 p-8 rounded-xl">
+            <button class="bg-white text-purple-500 px-6 py-2 rounded-full font-semibold hover:bg-gray-100">
+                Button 1
+            </button>
+            <button class="bg-yellow-400 text-purple-900 px-6 py-2 rounded-full font-bold hover:bg-yellow-300">
+                Button 2
+            </button>
+        </div>
+
+        <div class="grid grid-cols-3 gap-4">
+            <div class="bg-red-500 h-32 rounded"></div>
+            <div class="bg-yellow-500 h-32 rounded"></div>
+            <div class="bg-green-500 h-32 rounded"></div>
+        </div>
+
+        <div class="bg-gradient-to-r from-cyan-500 to-blue-500 p-8 rounded-2xl text-white">
+            <h3 class="text-3xl font-bold mb-4">Gradient Box</h3>
+            <p class="text-lg">Try modifying the gradient colors with the LLM!</p>
+        </div>
+    </div>
+</body>
+</html>
+

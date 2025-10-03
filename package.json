@@ -17,6 +17,16 @@
   ],
   "main": "./extension.js",
   "contributes": {
+    "configuration": {
+      "title": "Tailwind Preview",
+      "properties": {
+        "tailwindPreview.openRouterApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "OpenRouter API key for AI class editing (overrides built-in default if set)."
+        }
+      }
+    },
     "commands": [
       {
         "command": "tailwindPreview.openPreview",

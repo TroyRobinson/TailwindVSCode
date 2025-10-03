@@ -520,6 +520,8 @@ function getHelperScript() {
   #twv-editor .twv-actions { margin-top: 6px; display: flex; gap: 6px; justify-content: flex-end; }
   #twv-editor button { background: #0ea5e9; color: #0b1220; border: none; padding: 4px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; }
   #twv-editor button.twv-cancel { background: #374151; color: #e5e7eb; }
+  #twv-editor button.twv-llm { background: #8b5cf6; color: #fff; display: none; }
+  #twv-editor button.twv-llm.visible { display: inline-block; }
   /* Pause/Play controls */
   #twv-controls { position: fixed; top: 8px; right: 8px; z-index: 2147483648; display: flex; gap: 6px; }
   #twv-controls button { background: rgba(17,24,39,0.9); color: #e5e7eb; border: 1px solid #374151; border-radius: 6px; padding: 4px 8px; font-size: 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
@@ -541,12 +543,161 @@ function getHelperScript() {
       const editor = d.createElement('div'); editor.id = 'twv-editor'; editor.style.display = 'none';
       editor.innerHTML = '<div id="twv-title" style="margin-bottom:6px;color:#9ca3af">Edit Tailwind classes</div>'+
         '<textarea id="twv-input" spellcheck="false" rows="1" wrap="soft" aria-label="Tailwind classes"></textarea>'+
-        '<div class="twv-actions"><button class="twv-cancel">Cancel</button><button class="twv-save">Save</button></div>';
+        '<div class="twv-actions"><button class="twv-cancel">Cancel</button><button class="twv-llm">Send to LLM</button><button class="twv-save">Save</button></div>';
       d.documentElement.appendChild(editor);
       const input = editor.querySelector('#twv-input');
       const titleEl = editor.querySelector('#twv-title');
       const btnSave = editor.querySelector('.twv-save');
       const btnCancel = editor.querySelector('.twv-cancel');
+      const btnLLM = editor.querySelector('.twv-llm');
+      
+      // LLM API Configuration
+      const OPENROUTER_API_KEY = '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';
+      const OPENROUTER_MODEL = 'openai/gpt-oss-120b';
+      
+      // Detect "--" in input and show/hide LLM button
+      function updateLLMButtonVisibility() {
+        try {
+          const value = input.value || '';
+          if (value.includes(' -- ')) {
+            btnLLM.classList.add('visible');
+            console.log('[TWV LLM] Detected -- in input, showing LLM button');
+          } else {
+            btnLLM.classList.remove('visible');
+          }
+        } catch (e) {
+          console.error('[TWV LLM] Error updating button visibility:', e);
+        }
+      }
+      
+      // Call OpenRouter API to edit classes
+      async function callLLMToEditClasses(classesText, userPrompt) {
+        try {
+          console.log('[TWV LLM] Starting API call');
+          console.log('[TWV LLM] Classes:', classesText);
+          console.log('[TWV LLM] User prompt:', userPrompt);
+          
+          const systemPrompt = 'Edit these tailwind classes <tailwind_classes>' + classesText + '</tailwind_classes> and return the new, full, edited tailwind, according to the following prompt: <user_prompt>' + userPrompt + '</user_prompt> Return your classes in the format: <edited_tw> updated class list here </edited_tw>';
+          
+          console.log('[TWV LLM] Sending request to OpenRouter API');
+          
+          const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Authorization': 'Bearer ' + OPENROUTER_API_KEY,
+              'Content-Type': 'application/json',
+              'HTTP-Referer': 'https://github.com/user/TailwindVSCode',
+              'X-Title': 'Tailwind VSCode Extension'
+            },
+            body: JSON.stringify({
+              model: OPENROUTER_MODEL,
+              messages: [
+                { role: 'user', content: systemPrompt }
+              ]
+            })
+          });
+          
+          console.log('[TWV LLM] Response status:', response.status);
+          
+          if (!response.ok) {
+            const errorText = await response.text();
+            console.error('[TWV LLM] API error response:', errorText);
+            throw new Error('OpenRouter API request failed: ' + response.status + ' - ' + errorText);
+          }
+          
+          const data = await response.json();
+          console.log('[TWV LLM] API response data:', JSON.stringify(data, null, 2));
+          
+          const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+          if (!content) {
+            console.error('[TWV LLM] No content in response');
+            throw new Error('No content in API response');
+          }
+          
+          console.log('[TWV LLM] Raw content:', content);
+          
+          // Extract classes from <edited_tw> tags
+          const match = content.match(/<edited_tw>\s*([\s\S]*?)\s*<\/edited_tw>/i);
+          if (!match || !match[1]) {
+            console.error('[TWV LLM] Could not find <edited_tw> tags in response');
+            // Fallback: try to use the content directly if it looks like classes
+            const trimmed = content.trim();
+            if (trimmed && !trimmed.includes('\\n') && trimmed.split(' ').length < 50) {
+              console.log('[TWV LLM] Using raw content as fallback:', trimmed);
+              return trimmed;
+            }
+            throw new Error('Could not extract edited classes from response');
+          }
+          
+          const editedClasses = match[1].trim();
+          console.log('[TWV LLM] Extracted classes:', editedClasses);
+          return editedClasses;
+        } catch (e) {
+          console.error('[TWV LLM] Error calling API:', e);
+          throw e;
+        }
+      }
+      
+      // Handle LLM button click
+      async function handleLLMEdit() {
+        try {
+          const value = input.value || '';
+          const separatorIndex = value.indexOf(' -- ');
+          
+          if (separatorIndex === -1) {
+            console.warn('[TWV LLM] No -- separator found');
+            return;
+          }
+          
+          const classesText = value.substring(0, separatorIndex).trim();
+          const userPrompt = value.substring(separatorIndex + 4).trim();
+          
+          if (!classesText || !userPrompt) {
+            console.warn('[TWV LLM] Empty classes or prompt');
+            alert('Please provide both classes and a prompt separated by --');
+            return;
+          }
+          
+          console.log('[TWV LLM] Processing edit request');
+          btnLLM.disabled = true;
+          btnLLM.textContent = 'Processing...';
+          
+          try {
+            const editedClasses = await callLLMToEditClasses(classesText, userPrompt);
+            console.log('[TWV LLM] Successfully got edited classes:', editedClasses);
+            
+            // Update the input with the new classes
+            input.value = editedClasses;
+            console.log('[TWV LLM] Updated input value');
+            
+            // Trigger input event to update UI
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            
+            // Hide the LLM button since we no longer have "--"
+            updateLLMButtonVisibility();
+            
+            console.log('[TWV LLM] Edit complete');
+          } catch (e) {
+            console.error('[TWV LLM] Error during edit:', e);
+            alert('Error editing classes with LLM: ' + e.message);
+          } finally {
+            btnLLM.disabled = false;
+            btnLLM.textContent = 'Send to LLM';
+          }
+        } catch (e) {
+          console.error('[TWV LLM] Error in handleLLMEdit:', e);
+        }
+      }
+      
+      // Listen for input changes to show/hide LLM button
+      input.addEventListener('input', updateLLMButtonVisibility);
+      
+      // LLM button click handler
+      btnLLM.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        handleLLMEdit();
+      });
+      
       // Common editing shortcuts inside textarea (select/copy/cut/undo/redo)
       try {
         input.addEventListener('keydown', (ev) => {
@@ -737,7 +888,8 @@ function getHelperScript() {
           const vw = window.innerWidth; const vh = window.innerHeight;
           const ex = Math.min(vw - 16, Math.max(8, (x || rect.left) + 12));
           const ey = Math.min(vh - 16, Math.max(8, (y || rect.top) + 12));
-          input.value = (el.getAttribute('class') || '').trim();
+          const originalClasses = (el.getAttribute('class') || '').trim();
+          input.value = originalClasses;
           editor.style.left = ex + 'px'; editor.style.top = ey + 'px';
           editor.style.display = 'block';
 
@@ -763,10 +915,23 @@ function getHelperScript() {
             editor.style.top = ny + 'px';
           }
 
+          // Live preview: update element classes in real-time as user types
+          function livePreview() {
+            try {
+              const newVal = input.value.trim();
+              el.setAttribute('class', newVal);
+              console.log('[TWV LLM] Live preview updated:', newVal);
+            } catch (e) {
+              console.error('[TWV LLM] Error in live preview:', e);
+            }
+          }
+
           autosize();
           input.focus(); input.select();
           // Keep resizing as the user types or pastes
           input.addEventListener('input', autosize);
+          // Live preview on input changes
+          input.addEventListener('input', livePreview);
           // Resize on window changes too
           window.addEventListener('resize', autosize, { passive: true });
           if (titleEl) {
@@ -802,21 +967,35 @@ function getHelperScript() {
             }
             close();
           }
-          function close() {
+          function close(restoreOriginal) {
+            if (restoreOriginal) {
+              el.setAttribute('class', originalClasses);
+              console.log('[TWV LLM] Cancelled - restored original classes:', originalClasses);
+            }
             editor.style.display = 'none';
             input.blur();
             d.removeEventListener('keydown', onKey);
             input.removeEventListener('input', autosize);
+            input.removeEventListener('input', livePreview);
             window.removeEventListener('resize', autosize);
           }
           function onKey(ev) {
-            if (ev.key === 'Escape') { ev.preventDefault(); close(); }
-            // Enter without Shift commits; Shift+Enter inserts newline
-            if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey || !ev.shiftKey)) { ev.preventDefault(); commit(); }
+            if (ev.key === 'Escape') { ev.preventDefault(); close(true); }
+            // Enter without Shift: if input contains " -- ", trigger LLM; otherwise commit
+            if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey || !ev.shiftKey)) { 
+              ev.preventDefault(); 
+              const value = input.value || '';
+              if (value.includes(' -- ')) {
+                console.log('[TWV LLM] Enter pressed with -- detected, triggering LLM');
+                handleLLMEdit();
+              } else {
+                commit(); 
+              }
+            }
           }
           // Editing shortcuts handled by input-level keydown listener above
           d.addEventListener('keydown', onKey, { capture: true });
-          btnCancel.onclick = (ev) => { ev.preventDefault(); close(); };
+          btnCancel.onclick = (ev) => { ev.preventDefault(); close(true); };
           btnSave.onclick = (ev) => { ev.preventDefault(); commit(); };
         } catch (e) { console.error('openEditor error', e); }
       }
@@ -1477,6 +1656,8 @@ function getRemoteClientScript() {
         "#twv-editor textarea { width: 100%; min-height: 42px; resize: vertical; font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \\\"Liberation Mono\\\", \\\"Courier New\\\", monospace; padding: 8px; border-radius: 6px; border: 1px solid #334155; background: #0f172a; color: #e5e7eb; }"+
         "#twv-editor .twv-actions { margin-top: 8px; display: flex; gap: 8px; justify-content: flex-end; }"+
         "#twv-editor .twv-actions button { padding: 6px 10px; font-size: 12px; border: 1px solid #334155; border-radius: 6px; background: #111827; color: #e5e7eb; cursor: pointer; }"+
+        "#twv-editor button.twv-llm { background: #8b5cf6; color: #fff; display: none; }"+
+        "#twv-editor button.twv-llm.visible { display: inline-block; }"+
         "#twv-shield { position: fixed; inset: 0; z-index: 2147483630; pointer-events: none; }"+
         "html.twv-paused { cursor: default !important; }"+
       "'; d.documentElement.appendChild(style);"+
@@ -1485,11 +1666,19 @@ function getRemoteClientScript() {
       "const editor = d.createElement('div'); editor.id = 'twv-editor'; editor.style.display = 'none';"+
       "editor.innerHTML = '<div id=\\\"twv-title\\\" style=\\\"margin-bottom:6px;color:#9ca3af\\\">Edit Tailwind classes</div>'+"+
         "'<textarea id=\\\"twv-input\\\" spellcheck=\\\"false\\\" rows=\\\"1\\\" wrap=\\\"soft\\\" aria-label=\\\"Tailwind classes\\\"></textarea>'+"+
-        "'<div class=\\\"twv-actions\\\"><button class=\\\"twv-cancel\\\">Cancel</button><button class=\\\"twv-save\\\">Save</button></div>';"+
+        "'<div class=\\\"twv-actions\\\"><button class=\\\"twv-cancel\\\">Cancel</button><button class=\\\"twv-llm\\\">Send to LLM</button><button class=\\\"twv-save\\\">Save</button></div>';"+
       "d.documentElement.appendChild(editor);"+
       "const input = editor.querySelector('#twv-input');"+
       "const btnSave = editor.querySelector('.twv-save');"+
       "const btnCancel = editor.querySelector('.twv-cancel');"+
+      "const btnLLM = editor.querySelector('.twv-llm');"+
+      "const OPENROUTER_API_KEY = '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';"+
+      "const OPENROUTER_MODEL = 'openai/gpt-oss-120b';"+
+      "function updateLLMButtonVisibility() { try { var value = input.value || ''; if (value.includes(' -- ')) { btnLLM.classList.add('visible'); console.log('[TWV LLM Remote] Detected -- in input'); } else { btnLLM.classList.remove('visible'); } } catch(e) { console.error('[TWV LLM Remote] Error updating button:', e); } }"+
+      "async function callLLMToEditClasses(classesText, userPrompt) { try { console.log('[TWV LLM Remote] API call starting'); console.log('[TWV LLM Remote] Classes:', classesText); console.log('[TWV LLM Remote] Prompt:', userPrompt); var systemPrompt = 'Edit these tailwind classes <tailwind_classes>' + classesText + '</tailwind_classes> and return the new, full, edited tailwind, according to the following prompt: <user_prompt>' + userPrompt + '</user_prompt> Return your classes in the format: <edited_tw> updated class list here </edited_tw>'; var response = await fetch('https://openrouter.ai/api/v1/chat/completions', { method: 'POST', headers: { 'Authorization': 'Bearer ' + OPENROUTER_API_KEY, 'Content-Type': 'application/json', 'HTTP-Referer': 'https://github.com/user/TailwindVSCode', 'X-Title': 'Tailwind VSCode Extension' }, body: JSON.stringify({ model: OPENROUTER_MODEL, messages: [{ role: 'user', content: systemPrompt }] }) }); console.log('[TWV LLM Remote] Response status:', response.status); if (!response.ok) { var errorText = await response.text(); console.error('[TWV LLM Remote] API error:', errorText); throw new Error('API request failed: ' + response.status); } var data = await response.json(); console.log('[TWV LLM Remote] Response data:', JSON.stringify(data, null, 2)); var content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content; if (!content) { console.error('[TWV LLM Remote] No content in response'); throw new Error('No content in API response'); } console.log('[TWV LLM Remote] Raw content:', content); var match = content.match(/<edited_tw>\\s*([\\s\\S]*?)\\s*<\\/edited_tw>/i); if (!match || !match[1]) { console.error('[TWV LLM Remote] Could not find <edited_tw> tags'); var trimmed = content.trim(); if (trimmed && !trimmed.includes('\\n') && trimmed.split(' ').length < 50) { console.log('[TWV LLM Remote] Using raw content as fallback'); return trimmed; } throw new Error('Could not extract edited classes'); } var editedClasses = match[1].trim(); console.log('[TWV LLM Remote] Extracted classes:', editedClasses); return editedClasses; } catch(e) { console.error('[TWV LLM Remote] Error calling API:', e); throw e; } }"+
+      "async function handleLLMEdit() { try { var value = input.value || ''; var separatorIndex = value.indexOf(' -- '); if (separatorIndex === -1) { console.warn('[TWV LLM Remote] No -- separator found'); return; } var classesText = value.substring(0, separatorIndex).trim(); var userPrompt = value.substring(separatorIndex + 4).trim(); if (!classesText || !userPrompt) { console.warn('[TWV LLM Remote] Empty classes or prompt'); alert('Please provide both classes and a prompt separated by --'); return; } console.log('[TWV LLM Remote] Processing edit request'); btnLLM.disabled = true; btnLLM.textContent = 'Processing...'; try { var editedClasses = await callLLMToEditClasses(classesText, userPrompt); console.log('[TWV LLM Remote] Successfully got edited classes:', editedClasses); input.value = editedClasses; console.log('[TWV LLM Remote] Updated input value'); input.dispatchEvent(new Event('input', { bubbles: true })); updateLLMButtonVisibility(); console.log('[TWV LLM Remote] Edit complete'); } catch(e) { console.error('[TWV LLM Remote] Error during edit:', e); alert('Error editing classes with LLM: ' + e.message); } finally { btnLLM.disabled = false; btnLLM.textContent = 'Send to LLM'; } } catch(e) { console.error('[TWV LLM Remote] Error in handleLLMEdit:', e); } }"+
+      "input.addEventListener('input', updateLLMButtonVisibility);"+
+      "btnLLM.addEventListener('click', function(ev) { ev.preventDefault(); handleLLMEdit(); });"+
       // Common editing shortcuts inside textarea (select/copy/cut/undo/redo) with clipboard fallback
       "try { input.addEventListener('keydown', function(ev){ try { const k = String(ev.key||'').toLowerCase(); const mod = !!(ev.metaKey||ev.ctrlKey); if (!mod) return; if (k==='a'){ ev.preventDefault(); ev.stopPropagation(); try{ input.select(); }catch(_){} return; } if (k==='c'){ ev.preventDefault(); ev.stopPropagation(); var ok=false; try{ ok = !!document.execCommand('copy'); }catch(_){} if (!ok) { try { var s = (input.selectionStart|0), e = (input.selectionEnd|0); var txt = (e>s) ? input.value.slice(s,e) : String(input.value||''); window.parent && window.parent.postMessage({ source:'twv-client', type:'clipboardWrite', text: txt }, '*'); } catch(_){} } return; } if (k==='x'){ ev.preventDefault(); ev.stopPropagation(); var ok=false; try{ ok = !!document.execCommand('cut'); }catch(_){} if (!ok) { try { var s = (input.selectionStart|0), e = (input.selectionEnd|0); if (e>s) { var txt = input.value.slice(s,e); window.parent && window.parent.postMessage({ source:'twv-client', type:'clipboardWrite', text: txt }, '*'); input.value = input.value.slice(0,s) + input.value.slice(e); input.dispatchEvent(new Event('input', { bubbles:true })); } } catch(_){} } return; } if (k==='z'){ ev.preventDefault(); ev.stopPropagation(); try{ document.execCommand(ev.shiftKey ? 'redo' : 'undo'); }catch(_){} return; } if (k==='y'){ ev.preventDefault(); ev.stopPropagation(); try{ document.execCommand('redo'); }catch(_){} return; } } catch(_){} }, { capture: true }); } catch(_){}"+
       
@@ -1514,18 +1703,19 @@ function getRemoteClientScript() {
       "window.addEventListener('message', (ev) => { try { const data = ev.data || {}; if (data && data.source === 'twv-host' && data.type === 'setPaused') setPaused(!!data.value); } catch(_){} });"+
       
       "function openEditorFor(el, x, y) {"+
-        "const cur = (el.getAttribute('class') || '').trim();"+
-        "input.value = cur; editor.style.display = 'block'; editor.style.transform = 'none'; input.focus(); try { input.setSelectionRange(cur.length, cur.length); } catch(_) {}"+
+        "const originalClasses = (el.getAttribute('class') || '').trim();"+
+        "input.value = originalClasses; editor.style.display = 'block'; editor.style.transform = 'none'; input.focus(); try { input.setSelectionRange(originalClasses.length, originalClasses.length); } catch(_) {}"+
         "const target = el.getBoundingClientRect(); const vw = window.innerWidth; const vh = window.innerHeight; let r = editor.getBoundingClientRect();"+
         "let ex = (typeof x === 'number' ? x : (target.left + target.right)/2) - r.width/2; ex = Math.max(8, Math.min(vw - r.width - 8, ex));"+
         "let below = (typeof y === 'number' ? y : target.bottom) + 12; let above = (typeof y === 'number' ? y : target.top) - r.height - 12; let ey = below; if (ey + r.height + 8 > vh && above >= 8) ey = Math.max(8, above); ey = Math.max(8, Math.min(vh - r.height - 8, ey));"+
         "editor.style.left = ex + 'px'; editor.style.top = ey + 'px';"+
+        "function livePreview(){ try { var newVal = input.value.trim(); el.setAttribute('class', newVal); console.log('[TWV LLM Remote] Live preview updated:', newVal); } catch(e) { console.error('[TWV LLM Remote] Error in live preview:', e); } }"+
         "function autosize(){ input.style.height = 'auto'; input.style.height = Math.min(280, input.scrollHeight + 2) + 'px'; r = editor.getBoundingClientRect(); let ny = r.top; if (r.bottom > vh - 8) ny = Math.max(8, vh - 8 - r.height); editor.style.top = ny + 'px'; }"+
-        "autosize(); input.addEventListener('input', autosize); window.addEventListener('resize', autosize, { passive: true });"+
-        "function close(){ editor.style.display = 'none'; input.removeEventListener('input', autosize); d.removeEventListener('keydown', onKey, true); }"+
-        "async function commit(){ const before = cur; const after = (input.value || '').trim(); el.setAttribute('class', after); try { var txt=''; try{ txt=(el.textContent||'').trim().slice(0,160);}catch(_){txt='';} window.parent && window.parent.postMessage({ source:'twv-client', type:'update', before: before, after: after, text: txt, tag: (el.tagName||'').toLowerCase(), id: el.id||'' }, '*'); } catch(e){} close(); }"+
-        "function onKey(ev){ if (ev.key === 'Escape') { ev.preventDefault(); close(); } if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey || !ev.shiftKey)) { ev.preventDefault(); commit(); } }"+
-        "d.addEventListener('keydown', onKey, { capture:true }); btnCancel.onclick = (ev) => { ev.preventDefault(); close(); }; btnSave.onclick = (ev) => { ev.preventDefault(); commit(); };"+
+        "autosize(); input.addEventListener('input', autosize); input.addEventListener('input', livePreview); window.addEventListener('resize', autosize, { passive: true });"+
+        "function close(restoreOriginal){ if (restoreOriginal) { el.setAttribute('class', originalClasses); console.log('[TWV LLM Remote] Cancelled - restored original classes:', originalClasses); } editor.style.display = 'none'; input.removeEventListener('input', autosize); input.removeEventListener('input', livePreview); d.removeEventListener('keydown', onKey, true); }"+
+        "async function commit(){ const before = originalClasses; const after = (input.value || '').trim(); el.setAttribute('class', after); try { var txt=''; try{ txt=(el.textContent||'').trim().slice(0,160);}catch(_){txt='';} window.parent && window.parent.postMessage({ source:'twv-client', type:'update', before: before, after: after, text: txt, tag: (el.tagName||'').toLowerCase(), id: el.id||'' }, '*'); } catch(e){} close(); }"+
+        "function onKey(ev){ if (ev.key === 'Escape') { ev.preventDefault(); close(true); } if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey || !ev.shiftKey)) { ev.preventDefault(); var value = input.value || ''; if (value.includes(' -- ')) { console.log('[TWV LLM Remote] Enter pressed with -- detected, triggering LLM'); handleLLMEdit(); } else { commit(); } } }"+
+        "d.addEventListener('keydown', onKey, { capture:true }); btnCancel.onclick = (ev) => { ev.preventDefault(); close(true); }; btnSave.onclick = (ev) => { ev.preventDefault(); commit(); };"+
       "}"+
       "d.addEventListener('dblclick', (e) => { const t = e.target; if (t && t.closest && t.closest('#twv-editor')) return; if (!(t instanceof Element)) return; e.preventDefault(); e.stopPropagation(); openEditorFor(t, e.clientX, e.clientY); }, { capture: true });"+
       "const swallow = (ev) => { if (!paused) return; const path = ev.composedPath ? ev.composedPath() : []; const t = ev.target; const inEditor = (n) => !!n && (n.id === 'twv-editor' || (n.closest && n.closest('#twv-editor'))); if (inEditor(t) || (Array.isArray(path) && path.some(inEditor))) return; ev.stopImmediatePropagation(); ev.preventDefault(); };"+

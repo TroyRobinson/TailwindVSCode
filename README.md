@@ -11,6 +11,7 @@ Features:
 - Hover over elements to see their classes in a tooltip, with a highlight box.
 - Pause/Resume control in preview to disable all interactivity for safe inspection and editing.
 - Editing runtime UI: When you edit classes on dynamically created elements, the extension applies the change to similar elements and updates inline/external script templates in the source when possible.
+- **NEW: AI-Powered Class Editing**: Use LLMs to edit Tailwind classes with natural language prompts! In the class editor, type your classes followed by " -- " and a description of how you want to modify them (e.g., "p-4 bg-blue-500 -- make it red with larger padding"). Press Enter or click "Send to LLM" to automatically generate the updated classes.
 - NEW: Server Preview for Vite/SSR dev servers. Open a URL (e.g., http://localhost:5173) in a webview, inject a lightweight client helper into your app, and edit Tailwind classes live. The extension persists exact string-literal class edits across your workspace (React/Vue/Svelte/HTML/etc.).
   - Includes a Pause/Resume toggle in the preview toolbar to suppress app interactions while selecting elements.
 
@@ -69,5 +70,41 @@ Step-by-step: test Server Preview
 
 Step-by-step: test classic HTML Preview
 1) Open an HTML file that uses Tailwind (CDN or local build).
-2) Click “Tailwind: Open Preview” in the editor title.
+2) Click "Tailwind: Open Preview" in the editor title.
 3) Hover to inspect classes; double‑click to edit. Edits persist to the HTML source for mapped elements; dynamic edits attempt to update inline/external scripts referenced by the HTML.
+
+## AI-Powered Class Editing
+
+The extension now includes LLM integration to help you edit Tailwind classes using natural language prompts!
+
+### How to use:
+
+1. **Double-click an element** in the preview to open the class editor
+2. **Type your current classes**, followed by ` -- ` (space-dash-dash-space), and then a description of how you want to change them
+3. **Press Enter** or click the **"Send to LLM"** button (purple button that appears when you type "--")
+4. The LLM will process your request and update the classes automatically
+5. **See changes live** - The preview updates in real-time as you type or as the LLM generates new classes
+6. When you're happy with the result, click **"Save"** to persist the changes to your HTML source file
+7. **Cancel to undo** - Click "Cancel" or press Escape to instantly revert to the original classes
+
+### Examples:
+
+- `p-4 bg-blue-500 text-white -- make it red`
+- `text-sm font-normal -- make the text larger and bold`
+- `bg-green-600 text-white p-6 rounded shadow-lg -- increase the shadow and padding`
+- `flex gap-4 items-center -- make it a grid with 3 columns`
+- `bg-gradient-to-r from-cyan-500 to-blue-500 -- change to a purple gradient`
+
+### Debugging:
+
+- Open your browser console (F12 in the preview window) to see detailed debugging logs
+- All LLM operations are logged with `[TWV LLM]` prefix
+- Logs include: API requests, responses, class extraction, and any errors
+
+### Technical details:
+
+- Uses OpenRouter API with the `openai/gpt-oss-120b` model
+- The LLM receives your classes and prompt in a structured format
+- Response is parsed from `<edited_tw>` tags
+- Falls back to raw response if tags aren't found
+- Works in both regular preview and server preview modes
