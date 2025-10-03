@@ -527,6 +527,18 @@ function getHelperScript() {
   #twv-controls button { background: rgba(17,24,39,0.9); color: #e5e7eb; border: 1px solid #374151; border-radius: 6px; padding: 4px 8px; font-size: 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
   #twv-controls button:hover { background: #111827; }
   #twv-controls svg { width: 14px; height: 14px; fill: currentColor; }
+  /* Settings modal */
+  #twv-settings-overlay { position: fixed; inset: 0; z-index: 2147483649; background: rgba(0,0,0,0.5); display: none; align-items: center; justify-content: center; }
+  #twv-settings-overlay.visible { display: flex; }
+  #twv-settings-modal { background: #111827; border: 1px solid #374151; border-radius: 8px; padding: 20px; width: min(90vw, 480px); box-shadow: 0 20px 50px rgba(0,0,0,0.6); position: relative; }
+  #twv-settings-modal h3 { margin: 0 0 16px 0; color: #e5e7eb; font-size: 18px; font-weight: 600; }
+  #twv-settings-modal .close-btn { position: absolute; top: 12px; right: 12px; background: transparent; border: none; color: #9ca3af; cursor: pointer; font-size: 24px; line-height: 1; padding: 4px 8px; }
+  #twv-settings-modal .close-btn:hover { color: #e5e7eb; }
+  #twv-settings-modal label { display: block; color: #9ca3af; font-size: 13px; margin-bottom: 6px; margin-top: 12px; }
+  #twv-settings-modal label:first-of-type { margin-top: 0; }
+  #twv-settings-modal input { display: block; width: 100%; background: #0b1220; color: #e5e7eb; border: 1px solid #374151; border-radius: 4px; padding: 8px 10px; font-size: 13px; font-family: ui-monospace, monospace; box-sizing: border-box; }
+  #twv-settings-modal input:focus { outline: none; border-color: #0ea5e9; }
+  #twv-settings-modal .hint { color: #6b7280; font-size: 11px; margin-top: 4px; }
   /* Interaction shield shown when paused */
   #twv-shield { position: fixed; inset: 0; z-index: 2147483644; background: transparent; display: none; pointer-events: none; }
   html.twv-paused #twv-shield { display: block; }
@@ -541,7 +553,8 @@ function getHelperScript() {
       const outline = d.createElement('div'); outline.id = 'twv-hover-outline'; outline.className='hidden'; d.documentElement.appendChild(outline);
       const tooltip = d.createElement('div'); tooltip.id = 'twv-tooltip'; tooltip.className='hidden'; d.documentElement.appendChild(tooltip);
       const editor = d.createElement('div'); editor.id = 'twv-editor'; editor.style.display = 'none';
-      editor.innerHTML = '<div id="twv-title" style="margin-bottom:6px;color:#9ca3af">Edit Tailwind classes</div>'+
+      editor.innerHTML = '<div id="twv-title" style="margin-bottom:4px;color:#9ca3af;font-size:13px;font-weight:500;">Edit Tailwind classes</div>'+
+        '<div style="margin-bottom:8px;color:#6b7280;font-size:11px;line-height:1.4;">Type " -- [prompt]" to the end of your classes for AI edits</div>'+
         '<textarea id="twv-input" spellcheck="false" rows="1" wrap="soft" aria-label="Tailwind classes"></textarea>'+
         '<div class="twv-actions"><button class="twv-cancel">Cancel</button><button class="twv-llm">Send to LLM</button><button class="twv-save">Save</button></div>';
       d.documentElement.appendChild(editor);
@@ -551,29 +564,48 @@ function getHelperScript() {
       const btnCancel = editor.querySelector('.twv-cancel');
       const btnLLM = editor.querySelector('.twv-llm');
       
-      // LLM API Configuration
-      const OPENROUTER_API_KEY = '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';
-      const OPENROUTER_MODEL = 'openai/gpt-oss-120b';
+      // LLM API Configuration (defaults)
+      const DEFAULT_OPENROUTER_API_KEY = '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';
+      const DEFAULT_OPENROUTER_MODEL = 'openai/gpt-oss-120b';
+      
+      // Get current settings (custom or default)
+      function getLLMSettings() {
+        try {
+          const customKey = localStorage.getItem('twv-openrouter-key');
+          const customModel = localStorage.getItem('twv-openrouter-model');
+          return {
+            apiKey: customKey || DEFAULT_OPENROUTER_API_KEY,
+            model: customModel || DEFAULT_OPENROUTER_MODEL
+          };
+        } catch (e) {
+          console.error('[TWV LLM] Error reading settings:', e);
+          return {
+            apiKey: DEFAULT_OPENROUTER_API_KEY,
+            model: DEFAULT_OPENROUTER_MODEL
+          };
+        }
+      }
       
       // Detect "--" in input and show/hide LLM button
       function updateLLMButtonVisibility() {
-        try {
-          const value = input.value || '';
-          if (value.includes(' -- ')) {
-            btnLLM.classList.add('visible');
-            console.log('[TWV LLM] Detected -- in input, showing LLM button');
-          } else {
-            btnLLM.classList.remove('visible');
+          try {
+            const value = input.value || '';
+            if (value.includes(' -- ')) {
+              btnLLM.classList.add('visible');
+            } else {
+              btnLLM.classList.remove('visible');
+            }
+          } catch (e) {
+            console.error('[TWV LLM] Error updating button visibility:', e);
           }
-        } catch (e) {
-          console.error('[TWV LLM] Error updating button visibility:', e);
-        }
       }
       
       // Call OpenRouter API to edit classes
       async function callLLMToEditClasses(classesText, userPrompt) {
         try {
+          const settings = getLLMSettings();
           console.log('[TWV LLM] Starting API call');
+          console.log('[TWV LLM] Using model:', settings.model);
           console.log('[TWV LLM] Classes:', classesText);
           console.log('[TWV LLM] User prompt:', userPrompt);
           
@@ -584,13 +616,13 @@ function getHelperScript() {
           const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
             method: 'POST',
             headers: {
-              'Authorization': 'Bearer ' + OPENROUTER_API_KEY,
+              'Authorization': 'Bearer ' + settings.apiKey,
               'Content-Type': 'application/json',
               'HTTP-Referer': 'https://github.com/user/TailwindVSCode',
               'X-Title': 'Tailwind VSCode Extension'
             },
             body: JSON.stringify({
-              model: OPENROUTER_MODEL,
+              model: settings.model,
               messages: [
                 { role: 'user', content: systemPrompt }
               ]
@@ -766,11 +798,66 @@ function getHelperScript() {
       d.documentElement.appendChild(shield);
       const controls = d.createElement('div');
       controls.id = 'twv-controls';
-      controls.innerHTML = '<button id="twv-toggle" title="Pause interactions"><span class="twv-icon"></span><span class="twv-label">Pause</span></button>';
+      controls.innerHTML = '<button id="twv-toggle" title="Pause interactions"><span class="twv-icon"></span><span class="twv-label">Pause</span></button><button id="twv-settings-btn" title="Settings">⚙️</button>';
       d.documentElement.appendChild(controls);
+      
+      // Settings modal
+      const settingsOverlay = d.createElement('div');
+      settingsOverlay.id = 'twv-settings-overlay';
+      settingsOverlay.innerHTML = '<div id="twv-settings-modal"><button class="close-btn" aria-label="Close">&times;</button><h3>Settings</h3><label>OpenRouter API Key<div class="hint">Leave empty to use default</div></label><input type="text" id="twv-api-key" placeholder="sk-or-v1-..." /><label>Model Name<div class="hint">Default: openai/gpt-oss-120b</div></label><input type="text" id="twv-model" placeholder="openai/gpt-oss-120b" /><div style="margin-top:20px;padding-top:16px;border-top:1px solid #374151;display:flex;justify-content:flex-end;"><button id="twv-save-settings" style="background:#0ea5e9;color:#fff;border:none;padding:8px 16px;border-radius:4px;cursor:pointer;font-size:12px;">Save</button></div></div>';
+      d.documentElement.appendChild(settingsOverlay);
       const toggleBtn = controls.querySelector('#twv-toggle');
+      const settingsBtn = controls.querySelector('#twv-settings-btn');
       const iconSpan = toggleBtn.querySelector('.twv-icon');
       const labelSpan = toggleBtn.querySelector('.twv-label');
+      const apiKeyInput = settingsOverlay.querySelector('#twv-api-key');
+      const modelInput = settingsOverlay.querySelector('#twv-model');
+      const settingsCloseBtn = settingsOverlay.querySelector('.close-btn');
+      const settingsSaveBtn = settingsOverlay.querySelector('#twv-save-settings');
+      
+      // Load saved settings from localStorage
+      try {
+        const savedKey = localStorage.getItem('twv-openrouter-key');
+        const savedModel = localStorage.getItem('twv-openrouter-model');
+        if (savedKey) apiKeyInput.value = savedKey;
+        if (savedModel) modelInput.value = savedModel;
+      } catch(_) {}
+      
+      // Settings modal handlers
+      function openSettings() {
+        settingsOverlay.classList.add('visible');
+        console.log('[TWV LLM] Settings modal opened');
+      }
+      function closeSettings() {
+        settingsOverlay.classList.remove('visible');
+        // Save settings to localStorage
+        try {
+          const key = apiKeyInput.value.trim();
+          const model = modelInput.value.trim();
+          if (key) {
+            localStorage.setItem('twv-openrouter-key', key);
+            console.log('[TWV LLM] API key saved');
+          } else {
+            localStorage.removeItem('twv-openrouter-key');
+            console.log('[TWV LLM] API key cleared (using default)');
+          }
+          if (model) {
+            localStorage.setItem('twv-openrouter-model', model);
+            console.log('[TWV LLM] Model saved:', model);
+          } else {
+            localStorage.removeItem('twv-openrouter-model');
+            console.log('[TWV LLM] Model cleared (using default)');
+          }
+        } catch(e) {
+          console.error('[TWV LLM] Error saving settings:', e);
+        }
+      }
+      
+      settingsBtn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); openSettings(); });
+      settingsCloseBtn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); closeSettings(); });
+      settingsSaveBtn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); closeSettings(); });
+      settingsOverlay.addEventListener('click', (e) => { if (e.target === settingsOverlay) closeSettings(); });
+      
       let paused = false;
       const playSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>';
       const pauseSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>';
@@ -791,8 +878,8 @@ function getHelperScript() {
 
       function isOurNode(node) {
         return node && (
-          node.id === 'twv-hover-outline' || node.id === 'twv-tooltip' || node.id === 'twv-editor' || node.id === 'twv-shield' || node.id === 'twv-controls' ||
-          (node.closest && (node.closest('#twv-hover-outline') || node.closest('#twv-tooltip') || node.closest('#twv-editor') || node.closest('#twv-controls')))
+          node.id === 'twv-hover-outline' || node.id === 'twv-tooltip' || node.id === 'twv-editor' || node.id === 'twv-shield' || node.id === 'twv-controls' || node.id === 'twv-settings-overlay' ||
+          (node.closest && (node.closest('#twv-hover-outline') || node.closest('#twv-tooltip') || node.closest('#twv-editor') || node.closest('#twv-controls') || node.closest('#twv-settings-overlay')))
         );
       }
 
@@ -889,9 +976,17 @@ function getHelperScript() {
           const ex = Math.min(vw - 16, Math.max(8, (x || rect.left) + 12));
           const ey = Math.min(vh - 16, Math.max(8, (y || rect.top) + 12));
           const originalClasses = (el.getAttribute('class') || '').trim();
+          
+          // Prevent scroll jumping when editor opens
+          const savedScrollY = window.scrollY;
+          const savedScrollX = window.scrollX;
+          
           input.value = originalClasses;
           editor.style.left = ex + 'px'; editor.style.top = ey + 'px';
           editor.style.display = 'block';
+          
+          // Restore scroll position immediately after display
+          window.scrollTo(savedScrollX, savedScrollY);
 
           // Auto-size the textarea to fit content up to a max height
           function autosize() {
@@ -920,14 +1015,20 @@ function getHelperScript() {
             try {
               const newVal = input.value.trim();
               el.setAttribute('class', newVal);
-              console.log('[TWV LLM] Live preview updated:', newVal);
             } catch (e) {
               console.error('[TWV LLM] Error in live preview:', e);
             }
           }
 
           autosize();
-          input.focus(); input.select();
+          
+          // Focus without scrolling
+          input.focus({ preventScroll: true }); 
+          input.select();
+          
+          // Restore scroll position after focus (in case preventScroll isn't supported)
+          window.scrollTo(savedScrollX, savedScrollY);
+          
           // Keep resizing as the user types or pastes
           input.addEventListener('input', autosize);
           // Live preview on input changes
@@ -1019,12 +1120,12 @@ function getHelperScript() {
       // Swallow most interactions while paused to avoid mutating app state
       const swallow = (ev) => {
         if (!paused) return;
-        // Allow interactions with our own UI controls/editor
+        // Allow interactions with our own UI controls/editor/settings
         const path = ev.composedPath ? ev.composedPath() : [];
         const t = ev.target;
         const inOurUi = (n) => !!n && (
-          (n.id === 'twv-controls' || n.id === 'twv-editor' || n.id === 'twv-tooltip' || n.id === 'twv-hover-outline') ||
-          (n.closest && (n.closest('#twv-controls') || n.closest('#twv-editor') || n.closest('#twv-tooltip') || n.closest('#twv-hover-outline')))
+          (n.id === 'twv-controls' || n.id === 'twv-editor' || n.id === 'twv-tooltip' || n.id === 'twv-hover-outline' || n.id === 'twv-settings-overlay') ||
+          (n.closest && (n.closest('#twv-controls') || n.closest('#twv-editor') || n.closest('#twv-tooltip') || n.closest('#twv-hover-outline') || n.closest('#twv-settings-overlay')))
         );
         if (inOurUi(t) || (Array.isArray(path) && path.some(inOurUi))) return;
         ev.stopImmediatePropagation();
@@ -1192,12 +1293,30 @@ function buildServerPreviewHtml(webview, iframeUrl, clientScriptUrl) {
     <title>Tailwind Server Preview</title>
     <style>
       html, body { height: 100%; }
-      body { margin: 0; font: 12px/1.4 -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; color: #111827; }
-      #bar { display:flex; align-items:center; gap:8px; padding:6px 8px; background:#f1f5f9; border-bottom:1px solid #e2e8f0; }
-      #bar input { flex: 1 1 auto; padding:6px 8px; border:1px solid #cbd5e1; border-radius:6px; font-size:12px; }
-      #bar button { padding:6px 10px; font-size:12px; border:1px solid #cbd5e1; border-radius:6px; background:white; cursor:pointer; }
-      #bar button.active { background:#0ea5e9; color:white; border-color:#0284c7; }
-      #bar .hint { color:#475569; }
+      body { margin: 0; font: 12px/1.4 -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; color: #e5e7eb; }
+      #bar { display:flex; align-items:center; gap:8px; padding:6px 8px; background:#111827; border-bottom:1px solid #374151; }
+      #bar input { flex: 1 1 auto; padding:6px 8px; border:1px solid #374151; border-radius:6px; font-size:12px; background:#0b1220; color:#e5e7eb; }
+      #bar button { padding:6px 8px; font-size:12px; border:1px solid #374151; border-radius:6px; background:#1f2937; color:#e5e7eb; cursor:pointer; display:inline-flex; align-items:center; justify-content:center; }
+      #bar button:hover { background:#374151; }
+      #bar button svg { width:16px; height:16px; fill:currentColor; }
+      #bar #pause { color: #9ca3af; }
+      #bar #pause.playing { color: #0ea5e9; }
+      #bar .hint { color:#9ca3af; }
+      #settings-overlay { position: fixed; inset: 0; z-index: 999999; background: rgba(0,0,0,0.5); display: none; align-items: center; justify-content: center; }
+      #settings-overlay.visible { display: flex; }
+      #settings-modal { background: #111827; border: 1px solid #374151; border-radius: 8px; padding: 20px; width: min(90vw, 480px); box-shadow: 0 20px 50px rgba(0,0,0,0.6); position: relative; }
+      #settings-modal h3 { margin: 0 0 16px 0; color: #e5e7eb; font-size: 18px; font-weight: 600; }
+      #settings-modal .close-btn { position: absolute; top: 12px; right: 12px; background: transparent; border: none; color: #9ca3af; cursor: pointer; font-size: 24px; line-height: 1; padding: 4px 8px; }
+      #settings-modal .close-btn:hover { color: #e5e7eb; }
+      #settings-modal label { display: block; color: #9ca3af; font-size: 13px; margin-bottom: 6px; margin-top: 12px; }
+      #settings-modal label:first-of-type { margin-top: 0; }
+      #settings-modal input { display: block; width: 100%; background: #0b1220; color: #e5e7eb; border: 1px solid #374151; border-radius: 4px; padding: 8px 10px; font-size: 13px; font-family: ui-monospace, monospace; box-sizing: border-box; }
+      #settings-modal input:focus { outline: none; border-color: #0ea5e9; }
+      #settings-modal .hint { color: #6b7280; font-size: 11px; margin-top: 4px; }
+      #settings-modal .section-divider { margin-top: 20px; padding-top: 16px; border-top: 1px solid #374151; }
+      #settings-modal button.save-btn { background: #0ea5e9; color: #fff; border: 1px solid #0284c7; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+      #settings-modal button.save-btn:hover { background: #0284c7; }
+      #settings-modal input[readonly] { cursor: text; user-select: all; }
       #frame { width: 100%; height: calc(100% - 40px); border:0; }
       #warn { padding: 8px; background: #fff7ed; border-top: 1px solid #fde68a; color: #7c2d12; display:none; }
     </style>
@@ -1206,24 +1325,99 @@ function buildServerPreviewHtml(webview, iframeUrl, clientScriptUrl) {
     <div id="bar">
       <span class="hint">URL:</span>
       <input id="url" value="${esc(iframeUrl)}" />
-      <button id="go">Reload</button>
-      <button id="copy">Copy Client Script Tag</button>
-      <button id="pause" title="Pause interactions (p)">Pause</button>
-      <span class="hint">Client:</span>
-      <code id="client">${esc(clientScriptUrl)}</code>
+      <button id="go" title="Reload"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg></button>
+      <button id="pause" title="Resume interactions (p)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg></button>
+      <button id="settings-btn" title="Settings">⚙️</button>
     </div>
     <iframe id="frame" src="${esc(iframeUrl)}"></iframe>
     <div id="warn"></div>
+    <div id="settings-overlay">
+      <div id="settings-modal">
+        <button class="close-btn" aria-label="Close">&times;</button>
+        <h3>Settings</h3>
+        <label>OpenRouter API Key<div class="hint">Leave empty to use default</div></label>
+        <input type="text" id="api-key" placeholder="sk-or-v1-..." />
+        <label>Model Name<div class="hint">Default: openai/gpt-oss-120b</div></label>
+        <input type="text" id="model" placeholder="openai/gpt-oss-120b" />
+        <div class="section-divider">
+          <label style="margin-top: 0;">Client Script URL<div class="hint">Add this script tag to your HTML</div></label>
+          <input type="text" id="client" readonly value="${esc(clientScriptUrl)}" style="font-size:11px;" />
+          <button id="copy" class="save-btn" style="margin-top:8px;width:100%;">Copy Client Script Tag</button>
+        </div>
+        <div class="section-divider" style="display:flex;justify-content:flex-end;">
+          <button id="save-settings" class="save-btn">Save</button>
+        </div>
+      </div>
+    </div>
     <script>
       const vscode = (typeof acquireVsCodeApi === 'function') ? acquireVsCodeApi() : null;
       const input = document.getElementById('url');
       const btn = document.getElementById('go');
-      const copy = document.getElementById('copy');
-      const client = document.getElementById('client');
       const warn = document.getElementById('warn');
       const iframe = document.getElementById('frame');
       const pauseBtn = document.getElementById('pause');
-      let paused = false;
+      const settingsBtn = document.getElementById('settings-btn');
+      const settingsOverlay = document.getElementById('settings-overlay');
+      const settingsCloseBtn = settingsOverlay.querySelector('.close-btn');
+      const apiKeyInput = document.getElementById('api-key');
+      const modelInput = document.getElementById('model');
+      const copy = document.getElementById('copy');
+      const client = document.getElementById('client');
+      const saveSettingsBtn = document.getElementById('save-settings');
+      let paused = true;
+      
+      // Load saved settings
+      try {
+        const savedKey = localStorage.getItem('twv-openrouter-key');
+        const savedModel = localStorage.getItem('twv-openrouter-model');
+        if (savedKey) apiKeyInput.value = savedKey;
+        if (savedModel) modelInput.value = savedModel;
+      } catch(_) {}
+      
+      // Settings modal handlers
+      function openSettings() {
+        settingsOverlay.classList.add('visible');
+        console.log('[TWV Server] Settings modal opened');
+      }
+      function closeSettings() {
+        settingsOverlay.classList.remove('visible');
+        // Save settings
+        try {
+          const key = apiKeyInput.value.trim();
+          const model = modelInput.value.trim();
+          if (key) {
+            localStorage.setItem('twv-openrouter-key', key);
+            console.log('[TWV Server] API key saved');
+          } else {
+            localStorage.removeItem('twv-openrouter-key');
+            console.log('[TWV Server] API key cleared (using default)');
+          }
+          if (model) {
+            localStorage.setItem('twv-openrouter-model', model);
+            console.log('[TWV Server] Model saved:', model);
+          } else {
+            localStorage.removeItem('twv-openrouter-model');
+            console.log('[TWV Server] Model cleared (using default)');
+          }
+          // Notify iframe to clear cached settings
+          try {
+            iframe.contentWindow.postMessage({
+              source: 'twv-host',
+              type: 'clearSettingsCache'
+            }, '*');
+            console.log('[TWV Server] Notified client to clear settings cache');
+          } catch(e) {
+            console.log('[TWV Server] Could not notify client (may not be loaded yet)');
+          }
+        } catch(e) {
+          console.error('[TWV Server] Error saving settings:', e);
+        }
+      }
+      
+      settingsBtn.addEventListener('click', (e) => { e.preventDefault(); openSettings(); });
+      settingsCloseBtn.addEventListener('click', (e) => { e.preventDefault(); closeSettings(); });
+      saveSettingsBtn.addEventListener('click', (e) => { e.preventDefault(); closeSettings(); });
+      settingsOverlay.addEventListener('click', (e) => { if (e.target === settingsOverlay) closeSettings(); });
       btn.onclick = () => { try { const u = new URL(input.value); iframe.src = u.toString(); warn.style.display='none'; } catch { alert('Invalid URL'); } };
       copy.onclick = async () => {
         const tag = '<script src="${esc(clientScriptUrl)}"><' + '/script>';
@@ -1240,7 +1434,13 @@ function buildServerPreviewHtml(webview, iframeUrl, clientScriptUrl) {
           try { await navigator.clipboard.writeText(tag); alert('Copied script tag to clipboard.'); } catch { prompt('Copy this tag:', tag); }
         }
       };
-      function updatePauseButton(){ pauseBtn.textContent = paused ? 'Resume' : 'Pause'; pauseBtn.classList.toggle('active', paused); }
+      const playSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>';
+      const pauseSvg = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>';
+      function updatePauseButton(){ 
+        pauseBtn.innerHTML = paused ? playSvg : pauseSvg;
+        pauseBtn.title = paused ? 'Resume interactions (p)' : 'Pause interactions (p)';
+        pauseBtn.classList.toggle('playing', !paused);
+      }
       function sendPause(){ try { iframe && iframe.contentWindow && iframe.contentWindow.postMessage({ source:'twv-host', type:'setPaused', value: paused }, '*'); } catch(_){} }
       pauseBtn.onclick = () => { paused = !paused; updatePauseButton(); sendPause(); };
       window.addEventListener('keydown', (e) => {
@@ -1262,6 +1462,24 @@ function buildServerPreviewHtml(webview, iframeUrl, clientScriptUrl) {
           if (!iframe || ev.source !== iframe.contentWindow) return;
           const data = ev.data || {};
           if (data && data.source === 'twv-client' && data.type) {
+            // Handle settings request from client
+            if (data.type === 'getSettings') {
+              try {
+                const apiKey = localStorage.getItem('twv-openrouter-key') || '';
+                const model = localStorage.getItem('twv-openrouter-model') || '';
+                console.log('[TWV Server] Sending settings to client');
+                iframe.contentWindow.postMessage({
+                  source: 'twv-host',
+                  type: 'settings',
+                  requestId: data.requestId,
+                  apiKey: apiKey,
+                  model: model
+                }, '*');
+              } catch (e) {
+                console.error('[TWV Server] Error sending settings:', e);
+              }
+              return;
+            }
             if (!vscode) return;
             if (data.type === 'undo' || data.type === 'redo') {
               vscode.postMessage({ type: data.type === 'undo' ? 'serverUndo' : 'serverRedo' });
@@ -1664,7 +1882,8 @@ function getRemoteClientScript() {
       "const outline = d.createElement('div'); outline.id = 'twv-hover-outline'; outline.className='hidden'; d.documentElement.appendChild(outline);"+
       "const tooltip = d.createElement('div'); tooltip.id = 'twv-tooltip'; tooltip.className='hidden'; d.documentElement.appendChild(tooltip);"+
       "const editor = d.createElement('div'); editor.id = 'twv-editor'; editor.style.display = 'none';"+
-      "editor.innerHTML = '<div id=\\\"twv-title\\\" style=\\\"margin-bottom:6px;color:#9ca3af\\\">Edit Tailwind classes</div>'+"+
+      "editor.innerHTML = '<div id=\\\"twv-title\\\" style=\\\"margin-bottom:4px;color:#9ca3af;font-size:13px;font-weight:500;\\\">Edit Tailwind classes</div>'+"+
+        "'<div style=\\\"margin-bottom:8px;color:#6b7280;font-size:11px;line-height:1.4;\\\">Type \\\" -- [prompt]\\\" to the end of your classes for AI edits</div>'+"+
         "'<textarea id=\\\"twv-input\\\" spellcheck=\\\"false\\\" rows=\\\"1\\\" wrap=\\\"soft\\\" aria-label=\\\"Tailwind classes\\\"></textarea>'+"+
         "'<div class=\\\"twv-actions\\\"><button class=\\\"twv-cancel\\\">Cancel</button><button class=\\\"twv-llm\\\">Send to LLM</button><button class=\\\"twv-save\\\">Save</button></div>';"+
       "d.documentElement.appendChild(editor);"+
@@ -1672,10 +1891,12 @@ function getRemoteClientScript() {
       "const btnSave = editor.querySelector('.twv-save');"+
       "const btnCancel = editor.querySelector('.twv-cancel');"+
       "const btnLLM = editor.querySelector('.twv-llm');"+
-      "const OPENROUTER_API_KEY = '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';"+
-      "const OPENROUTER_MODEL = 'openai/gpt-oss-120b';"+
-      "function updateLLMButtonVisibility() { try { var value = input.value || ''; if (value.includes(' -- ')) { btnLLM.classList.add('visible'); console.log('[TWV LLM Remote] Detected -- in input'); } else { btnLLM.classList.remove('visible'); } } catch(e) { console.error('[TWV LLM Remote] Error updating button:', e); } }"+
-      "async function callLLMToEditClasses(classesText, userPrompt) { try { console.log('[TWV LLM Remote] API call starting'); console.log('[TWV LLM Remote] Classes:', classesText); console.log('[TWV LLM Remote] Prompt:', userPrompt); var systemPrompt = 'Edit these tailwind classes <tailwind_classes>' + classesText + '</tailwind_classes> and return the new, full, edited tailwind, according to the following prompt: <user_prompt>' + userPrompt + '</user_prompt> Return your classes in the format: <edited_tw> updated class list here </edited_tw>'; var response = await fetch('https://openrouter.ai/api/v1/chat/completions', { method: 'POST', headers: { 'Authorization': 'Bearer ' + OPENROUTER_API_KEY, 'Content-Type': 'application/json', 'HTTP-Referer': 'https://github.com/user/TailwindVSCode', 'X-Title': 'Tailwind VSCode Extension' }, body: JSON.stringify({ model: OPENROUTER_MODEL, messages: [{ role: 'user', content: systemPrompt }] }) }); console.log('[TWV LLM Remote] Response status:', response.status); if (!response.ok) { var errorText = await response.text(); console.error('[TWV LLM Remote] API error:', errorText); throw new Error('API request failed: ' + response.status); } var data = await response.json(); console.log('[TWV LLM Remote] Response data:', JSON.stringify(data, null, 2)); var content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content; if (!content) { console.error('[TWV LLM Remote] No content in response'); throw new Error('No content in API response'); } console.log('[TWV LLM Remote] Raw content:', content); var match = content.match(/<edited_tw>\\s*([\\s\\S]*?)\\s*<\\/edited_tw>/i); if (!match || !match[1]) { console.error('[TWV LLM Remote] Could not find <edited_tw> tags'); var trimmed = content.trim(); if (trimmed && !trimmed.includes('\\n') && trimmed.split(' ').length < 50) { console.log('[TWV LLM Remote] Using raw content as fallback'); return trimmed; } throw new Error('Could not extract edited classes'); } var editedClasses = match[1].trim(); console.log('[TWV LLM Remote] Extracted classes:', editedClasses); return editedClasses; } catch(e) { console.error('[TWV LLM Remote] Error calling API:', e); throw e; } }"+
+      "const DEFAULT_OPENROUTER_API_KEY = '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';"+
+      "const DEFAULT_OPENROUTER_MODEL = 'openai/gpt-oss-120b';"+
+      "let cachedSettings = null;"+
+      "async function getLLMSettings() { if (cachedSettings) return cachedSettings; return new Promise((resolve) => { try { if (window.parent && window.parent !== window) { var msgId = 'settings-' + Date.now(); var timeout = setTimeout(() => { console.warn('[TWV LLM Remote] Settings request timeout, using defaults'); resolve({ apiKey: DEFAULT_OPENROUTER_API_KEY, model: DEFAULT_OPENROUTER_MODEL }); }, 2000); window.addEventListener('message', function handler(ev) { try { if (ev.data && ev.data.source === 'twv-host' && ev.data.type === 'settings' && ev.data.requestId === msgId) { clearTimeout(timeout); window.removeEventListener('message', handler); var settings = { apiKey: ev.data.apiKey || DEFAULT_OPENROUTER_API_KEY, model: ev.data.model || DEFAULT_OPENROUTER_MODEL }; cachedSettings = settings; console.log('[TWV LLM Remote] Received settings from parent'); resolve(settings); } } catch(_) {} }); window.parent.postMessage({ source: 'twv-client', type: 'getSettings', requestId: msgId }, '*'); } else { resolve({ apiKey: DEFAULT_OPENROUTER_API_KEY, model: DEFAULT_OPENROUTER_MODEL }); } } catch(e) { console.error('[TWV LLM Remote] Error requesting settings:', e); resolve({ apiKey: DEFAULT_OPENROUTER_API_KEY, model: DEFAULT_OPENROUTER_MODEL }); } }); }"+
+      "function updateLLMButtonVisibility() { try { var value = input.value || ''; if (value.includes(' -- ')) { btnLLM.classList.add('visible'); } else { btnLLM.classList.remove('visible'); } } catch(e) { console.error('[TWV LLM Remote] Error updating button:', e); } }"+
+      "async function callLLMToEditClasses(classesText, userPrompt) { try { var settings = await getLLMSettings(); console.log('[TWV LLM Remote] API call starting'); console.log('[TWV LLM Remote] Using model:', settings.model); console.log('[TWV LLM Remote] Classes:', classesText); console.log('[TWV LLM Remote] Prompt:', userPrompt); var systemPrompt = 'Edit these tailwind classes <tailwind_classes>' + classesText + '</tailwind_classes> and return the new, full, edited tailwind, according to the following prompt: <user_prompt>' + userPrompt + '</user_prompt> Return your classes in the format: <edited_tw> updated class list here </edited_tw>'; var response = await fetch('https://openrouter.ai/api/v1/chat/completions', { method: 'POST', headers: { 'Authorization': 'Bearer ' + settings.apiKey, 'Content-Type': 'application/json', 'HTTP-Referer': 'https://github.com/user/TailwindVSCode', 'X-Title': 'Tailwind VSCode Extension' }, body: JSON.stringify({ model: settings.model, messages: [{ role: 'user', content: systemPrompt }] }) }); console.log('[TWV LLM Remote] Response status:', response.status); if (!response.ok) { var errorText = await response.text(); console.error('[TWV LLM Remote] API error:', errorText); throw new Error('API request failed: ' + response.status); } var data = await response.json(); console.log('[TWV LLM Remote] Response data:', JSON.stringify(data, null, 2)); var content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content; if (!content) { console.error('[TWV LLM Remote] No content in response'); throw new Error('No content in API response'); } console.log('[TWV LLM Remote] Raw content:', content); var match = content.match(/<edited_tw>\\s*([\\s\\S]*?)\\s*<\\/edited_tw>/i); if (!match || !match[1]) { console.error('[TWV LLM Remote] Could not find <edited_tw> tags'); var trimmed = content.trim(); if (trimmed && !trimmed.includes('\\n') && trimmed.split(' ').length < 50) { console.log('[TWV LLM Remote] Using raw content as fallback'); return trimmed; } throw new Error('Could not extract edited classes'); } var editedClasses = match[1].trim(); console.log('[TWV LLM Remote] Extracted classes:', editedClasses); return editedClasses; } catch(e) { console.error('[TWV LLM Remote] Error calling API:', e); throw e; } }"+
       "async function handleLLMEdit() { try { var value = input.value || ''; var separatorIndex = value.indexOf(' -- '); if (separatorIndex === -1) { console.warn('[TWV LLM Remote] No -- separator found'); return; } var classesText = value.substring(0, separatorIndex).trim(); var userPrompt = value.substring(separatorIndex + 4).trim(); if (!classesText || !userPrompt) { console.warn('[TWV LLM Remote] Empty classes or prompt'); alert('Please provide both classes and a prompt separated by --'); return; } console.log('[TWV LLM Remote] Processing edit request'); btnLLM.disabled = true; btnLLM.textContent = 'Processing...'; try { var editedClasses = await callLLMToEditClasses(classesText, userPrompt); console.log('[TWV LLM Remote] Successfully got edited classes:', editedClasses); input.value = editedClasses; console.log('[TWV LLM Remote] Updated input value'); input.dispatchEvent(new Event('input', { bubbles: true })); updateLLMButtonVisibility(); console.log('[TWV LLM Remote] Edit complete'); } catch(e) { console.error('[TWV LLM Remote] Error during edit:', e); alert('Error editing classes with LLM: ' + e.message); } finally { btnLLM.disabled = false; btnLLM.textContent = 'Send to LLM'; } } catch(e) { console.error('[TWV LLM Remote] Error in handleLLMEdit:', e); } }"+
       "input.addEventListener('input', updateLLMButtonVisibility);"+
       "btnLLM.addEventListener('click', function(ev) { ev.preventDefault(); handleLLMEdit(); });"+
@@ -1700,16 +1921,19 @@ function getRemoteClientScript() {
       "d.addEventListener('mouseleave', hideUI, { capture: true });"+
       "const shield = d.createElement('div'); shield.id = 'twv-shield'; d.documentElement.appendChild(shield);"+
       "let paused = false; function setPaused(on){ paused = !!on; d.documentElement.classList.toggle('twv-paused', paused); }"+
-      "window.addEventListener('message', (ev) => { try { const data = ev.data || {}; if (data && data.source === 'twv-host' && data.type === 'setPaused') setPaused(!!data.value); } catch(_){} });"+
+      "window.addEventListener('message', (ev) => { try { const data = ev.data || {}; if (data && data.source === 'twv-host') { if (data.type === 'setPaused') { setPaused(!!data.value); } else if (data.type === 'clearSettingsCache') { cachedSettings = null; console.log('[TWV LLM Remote] Settings cache cleared'); } } } catch(_){} });"+
       
       "function openEditorFor(el, x, y) {"+
         "const originalClasses = (el.getAttribute('class') || '').trim();"+
-        "input.value = originalClasses; editor.style.display = 'block'; editor.style.transform = 'none'; input.focus(); try { input.setSelectionRange(originalClasses.length, originalClasses.length); } catch(_) {}"+
+        "var savedScrollY = window.scrollY; var savedScrollX = window.scrollX;"+
+        "input.value = originalClasses; editor.style.display = 'block'; editor.style.transform = 'none';"+
+        "window.scrollTo(savedScrollX, savedScrollY);"+
+        "input.focus({ preventScroll: true }); window.scrollTo(savedScrollX, savedScrollY); try { input.setSelectionRange(originalClasses.length, originalClasses.length); } catch(_) {}"+
         "const target = el.getBoundingClientRect(); const vw = window.innerWidth; const vh = window.innerHeight; let r = editor.getBoundingClientRect();"+
         "let ex = (typeof x === 'number' ? x : (target.left + target.right)/2) - r.width/2; ex = Math.max(8, Math.min(vw - r.width - 8, ex));"+
         "let below = (typeof y === 'number' ? y : target.bottom) + 12; let above = (typeof y === 'number' ? y : target.top) - r.height - 12; let ey = below; if (ey + r.height + 8 > vh && above >= 8) ey = Math.max(8, above); ey = Math.max(8, Math.min(vh - r.height - 8, ey));"+
         "editor.style.left = ex + 'px'; editor.style.top = ey + 'px';"+
-        "function livePreview(){ try { var newVal = input.value.trim(); el.setAttribute('class', newVal); console.log('[TWV LLM Remote] Live preview updated:', newVal); } catch(e) { console.error('[TWV LLM Remote] Error in live preview:', e); } }"+
+        "function livePreview(){ try { var newVal = input.value.trim(); el.setAttribute('class', newVal); } catch(e) { console.error('[TWV LLM Remote] Error in live preview:', e); } }"+
         "function autosize(){ input.style.height = 'auto'; input.style.height = Math.min(280, input.scrollHeight + 2) + 'px'; r = editor.getBoundingClientRect(); let ny = r.top; if (r.bottom > vh - 8) ny = Math.max(8, vh - 8 - r.height); editor.style.top = ny + 'px'; }"+
         "autosize(); input.addEventListener('input', autosize); input.addEventListener('input', livePreview); window.addEventListener('resize', autosize, { passive: true });"+
         "function close(restoreOriginal){ if (restoreOriginal) { el.setAttribute('class', originalClasses); console.log('[TWV LLM Remote] Cancelled - restored original classes:', originalClasses); } editor.style.display = 'none'; input.removeEventListener('input', autosize); input.removeEventListener('input', livePreview); d.removeEventListener('keydown', onKey, true); }"+
