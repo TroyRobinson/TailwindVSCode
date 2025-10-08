@@ -15,6 +15,14 @@ Features:
 - NEW: Server Preview for Vite/SSR dev servers. Open a URL (e.g., http://localhost:5173) in a webview, inject a lightweight client helper into your app, and edit Tailwind classes live. The extension persists exact string-literal class edits across your workspace (React/Vue/Svelte/HTML/etc.).
   - Includes a Pause/Resume toggle in the preview toolbar to suppress app interactions while selecting elements.
 
+Client Script Gating (no bleed into browser)
+- The remote client script only auto-activates when your app is loaded inside the VS Code Server Preview (iframe).
+- In a normal browser tab, it stays off by default so overlays never get in your way.
+- To explicitly enable in a regular browser (optional):
+  - Add `?twv=1` to the URL, or
+  - Set `localStorage['twv-enable']='1'` (clear it or use `?twv=0` to disable).
+  - Tip: This preserves a clean browsing experience for new users by default.
+
 Notes:
 
 - Detection looks for the Tailwind CDN, references to files with "tailwind" in their name, or common Tailwind utility classes in `class` attributes.

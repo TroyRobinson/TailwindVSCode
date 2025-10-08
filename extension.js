@@ -1342,6 +1342,7 @@ function buildServerPreviewHtml(webview, iframeUrl, clientScriptUrl) {
         <div class="section-divider">
           <label style="margin-top: 0;">Client Script URL<div class="hint">Add this script tag to your HTML</div></label>
           <input type="text" id="client" readonly value="${esc(clientScriptUrl)}" style="font-size:11px;" />
+          <div class="hint" style="margin-top:6px;">Overlays auto-enable only inside this preview. In a normal browser, add <code>?twv=1</code> or set <code>localStorage['twv-enable']='1'</code> to enable; remove to disable.</div>
           <button id="copy" class="save-btn" style="margin-top:8px;width:100%;">Copy Client Script Tag</button>
         </div>
         <div class="section-divider" style="display:flex;justify-content:flex-end;">
@@ -1862,6 +1863,10 @@ function getRemoteClientScript() {
   return "(()=>{"+
     "try {"+
       "const d = document;"+
+      "const inFrame = (function(){ try { return (window.parent && window.parent !== window); } catch(_) { return false; } })();"+
+      "var qs=null, enableFlag=false, disableFlag=false;"+
+      "try { qs = new URLSearchParams(window.location.search || ''); enableFlag = qs.has('twv') || qs.has('devtools') || (window.localStorage && window.localStorage.getItem('twv-enable')==='1'); disableFlag = (qs.get('twv')==='0') || (window.localStorage && window.localStorage.getItem('twv-enable')==='0'); } catch(_) {}"+
+      "if (disableFlag || (!inFrame && !enableFlag)) { try { console.log('[TWV Remote] Disabled by default outside VS Code preview. Add ?twv=1 or set localStorage \\'twv-enable\\'=1 to enable.'); } catch(_) {} return; }"+
       "if (d.getElementById('twv-remote-client')) return;"+
       "const style = d.createElement('style'); style.id = 'twv-remote-client'; style.textContent = '"+
         "#twv-hover-outline { position: fixed; pointer-events: none; z-index: 2147483646; border: 2px solid #06b6d4; border-radius: 2px; box-shadow: 0 0 0 2px rgba(6,182,212,0.25); }"+
